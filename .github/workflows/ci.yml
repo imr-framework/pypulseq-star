@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clean-install-and-smoke:
+    name: Clean install and smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Upgrade packaging tools
+        run: python -m pip install --upgrade pip build
+
+      - name: Build source and wheel distributions
+        run: python -m build
+
+      - name: Install the built wheel with test dependencies
+        shell: bash
+        run: |
+          wheel_file="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "${wheel_file}"
+          python -m pip install "${wheel_file}[dev,plotting]"
+
+      - name: Verify clean installed import
+        shell: bash
+        run: |
+          cd "${RUNNER_TEMP}"
+          python - <<'PY'
+          from pathlib import Path
+          import importlib.metadata
+          import pypulseq_star
+
+          module_path = Path(pypulseq_star.__file__).resolve()
+          repository = Path(r"${{ github.workspace }}").resolve()
+
+          print(f"pypulseq_star version: {importlib.metadata.version('pypulseq-star')}")
+          print(f"imported from: {module_path}")
+
+          if repository in module_path.parents:
+              raise SystemExit(
+                  "Clean-install check failed: pypulseq_star was imported "
+                  "from the repository instead of the installed wheel."
+              )
+          PY
+
+      - name: Run installation smoke tests
+        run: |
+          python -m pytest             tests/tests/integration/test_installation.py             -ra
+
+      - name: Run four demo construction smoke tests
+        env:
+          MPLBACKEND: Agg
+        run: |
+          python -m pytest             tests/tests/integration/test_four_demos.py::test_demo_runs_without_plotting_or_export             -ra
+
+      - name: Show package and environment information
+        if: always()
+        run: |
+          python --version
+          python -m pip --version
+          python -m pip list

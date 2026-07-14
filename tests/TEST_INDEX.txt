@@ -1,0 +1,22 @@
+PyPulseq-Star replacement test suite
+
+Files:
+- pytest.ini
+- run_tests.py
+- tests/README.md
+- tests/__init__.py
+- tests/conftest.py
+- tests/helpers/__init__.py
+- tests/helpers/builders.py
+- tests/integration/__init__.py
+- tests/integration/test_four_demos.py
+- tests/integration/test_installation.py
+- tests/integration/test_writer_roundtrip.py
+- tests/unit/__init__.py
+- tests/unit/test_dashboard.py
+- tests/unit/test_events.py
+- tests/unit/test_plotter.py
+- tests/unit/test_relationships.py
+- tests/unit/test_sequence.py
+- tests/unit/test_shapes.py
+- tests/unit/test_writers.py

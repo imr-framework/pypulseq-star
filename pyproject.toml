@@ -1,0 +1,117 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pypulseq-star"
+dynamic = ["version"]
+description = "PyPulseq-like MRI sequence design with hierarchy, relationships, and Pulseq/gammaSTAR export."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Sairam Geethanath" },
+]
+keywords = [
+  "MRI",
+  "Pulseq",
+  "PyPulseq",
+  "gammaSTAR",
+  "pulse sequence",
+  "reproducible research",
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dependencies = [
+  "numpy>=1.24",
+  "pypulseq>=1.4",
+  "sympy>=1.12",
+]
+
+[project.optional-dependencies]
+plotting = [
+  "matplotlib>=3.7",
+]
+dashboard = [
+  "grandalf>=0.8",
+  "matplotlib>=3.7",
+  "netgraph>=4.13",
+  "networkx>=3.0",
+  "streamlit>=1.35",
+  "streamlit-flow-component>=1.6",
+  "watchdog>=4.0",
+]
+dev = [
+  "build>=1.2",
+  "mypy>=1.10",
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "ruff>=0.6",
+  "twine>=5.1",
+]
+all = [
+  "pypulseq-star[plotting,dashboard,dev]",
+]
+
+[tool.hatch.version]
+path = "src/pypulseq_star/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pypulseq_star"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/examples",
+  "/tests",
+  "/README.md",
+  "/CONTRIBUTING.md",
+  "/LICENSE",
+  "/pyproject.toml",
+]
+
+[tool.hatch.build]
+include = [
+  "src/pypulseq_star/**/*.py",
+  "src/pypulseq_star/**/*.json",
+  "src/pypulseq_star/**/*.svg",
+  "src/pypulseq_star/py.typed",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N"]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/*.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = ["pypulseq_star"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+packages = ["pypulseq_star"]

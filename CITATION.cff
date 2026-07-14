@@ -1,0 +1,56 @@
+cff-version: 1.2.0
+message: >-
+  If you use PyPulseq-Star in research, software development, teaching,
+  or published work, please cite the software using the metadata below.
+title: PyPulseq-Star
+type: software
+authors:
+  - family-names: Geethanath
+    given-names: Sairam
+    orcid: "https://orcid.org/0000-0002-3776-4114" # TODO: replace with the correct ORCID or remove
+version: 0.1.0a1
+date-released: "2026-07-13"
+url: "https://github.com/imr-framework/pypulseq-star"
+repository-code: "https://github.com/imr-framework/pypulseq-star"
+license: "MIT"
+keywords:
+  - MRI
+  - magnetic resonance imaging
+  - pulse sequence
+  - Pulseq
+  - PyPulseq
+  - gammaSTAR
+  - reproducible research
+  - scientific software
+
+preferred-citation:
+  type: software
+  title: PyPulseq-Star
+  authors:
+    - family-names: Geethanath
+      given-names: Sairam
+      orcid: "https://orcid.org/0000-0002-3776-4114" # TODO: replace with the correct ORCID or remove
+  version: 0.1.0a1
+  date-released: "2026-07-13"
+  url: "https://github.com/imr-framework/pypulseq-star"
+  notes: >-
+    Preferred citation placeholder before publication of the peer-reviewed
+    SoftwareX article. Replace this block with the published article citation
+    and DOI after acceptance.
+
+# After the SoftwareX paper is published, we will replace preferred-citation with:
+#
+# preferred-citation:
+#   type: article
+#   title: "PyPulseq-Star: [final article title]"
+#   authors:
+#     - family-names: Geethanath
+#       given-names: Sairam
+#       orcid: "https://orcid.org/0000-0002-3776-4114"
+#   journal: SoftwareX
+#   year: 2026
+#   volume: "REPLACE"
+#   issue: "REPLACE"
+#   start: "REPLACE"
+#   end: "REPLACE"
+#   doi: "10.1016/j.softx.REPLACE"
