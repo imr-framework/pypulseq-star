@@ -21,7 +21,7 @@ keywords = [
   "reproducible research",
 ]
 classifiers = [
-  "Development Status :: 3 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
