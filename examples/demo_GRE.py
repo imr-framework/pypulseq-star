@@ -464,7 +464,10 @@ def main(
         debug=debug,
     )
 
-    print(f"Orientation: {protocol.get_parameter("slice_orientation", orientation)}")
+    print(
+    f"Orientation: "
+    f"{protocol.get_parameter('slice_orientation', orientation)}"
+    )
     print(f"Read direction:  {seq.encoding_frame.read_dir}")
     print(f"Phase direction: {seq.encoding_frame.phase_dir}")
     print(f"Slice direction: {seq.encoding_frame.slice_dir}")
