@@ -1,5 +1,8 @@
 """PyPulseq-compatible delay constructor with central raster enforcement.
 
+A numeric construction placeholder is used only when necessary; the original
+expression remains attached for Sequence.resolve().
+
 Drop this in as: src/pypulseq_star/make/delay.py
 
 This keeps examples short: callers can continue to write
@@ -16,10 +19,12 @@ from collections.abc import Mapping
 from typing import Any
 
 from pypulseq_star.events.delay import SeqStarDelayEvent
+from pypulseq_star.expressions import Expression
+from ._symbolic import attach_symbolic_specs, evaluate_default, symbolic_specs
 
 
 def make_delay(
-    delay: float,
+    delay: float | Expression,
     *,
     name: str | None = None,
     role: str | None = None,
@@ -52,8 +57,16 @@ def make_delay(
         False by default to avoid verbose logs during relationship solving.
     """
 
-    return SeqStarDelayEvent(
-        float(delay),
+    specs = symbolic_specs(duration=delay, delay=delay)
+    numeric_delay = evaluate_default(
+        delay,
+        fallback=0.0,
+        field_name="delay duration",
+    )
+    unresolved = {"duration": numeric_delay, "delay": numeric_delay} if specs else {}
+
+    event = SeqStarDelayEvent(
+        float(numeric_delay),
         name=name,
         role=role,
         system=system,
@@ -62,6 +75,11 @@ def make_delay(
         warn_on_snap=warn_on_snap,
         parameters=parameters,
         metadata=metadata,
+    )
+    return attach_symbolic_specs(
+        event,
+        specs,
+        placeholders=unresolved,
     )
 
 

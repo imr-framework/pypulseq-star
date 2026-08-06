@@ -52,3 +52,49 @@ def test_writers_create_nonempty_files(system, output_dir: Path) -> None:
     assert seq_path.exists() and seq_path.stat().st_size > 0
     assert json_path.exists() and json_path.stat().st_size > 0
     assert json.loads(json_path.read_text(encoding="utf-8"))["name"] == "test_fid"
+
+
+def test_gammastar_adc_geometry_defaults_are_consistent_without_gradients(system) -> None:
+    """Gradient-free acquisitions still export complete gammaSTAR geometry."""
+
+    seq = build_fid_sequence(system, num_samples=48)
+    document = GammaStarWriter(seq).to_dict()
+    parameters = document["parameters"]
+
+    assert parameters["root.info.seq_dim"]["inputs"] == {
+        "seq_dim": "root.prot.seq_dim"
+    }
+    assert "return 0" not in parameters["root.info.seq_dim"]["script"]
+
+    assert parameters["root.prot.n_x"]["script"] == "return 48"
+    assert parameters["root.prot.n_y"]["script"] == "return 1"
+    assert parameters["root.prot.n_z"]["script"] == "return 1"
+
+    assert parameters["root.mat_size"]["inputs"] == {
+        "n_x": "root.prot.n_x",
+        "n_y": "root.prot.n_y",
+        "n_z": "root.prot.n_z",
+    }
+    assert parameters["root.acq_size"]["inputs"] == {
+        "mat_size": "root.mat_size"
+    }
+    assert parameters["root.fov"]["inputs"] == {
+        "fov": "root.prot.fov",
+        "slice_thickness": "root.prot.slice_thickness",
+    }
+
+    adc_paths = [
+        key.removesuffix(".trajectory")
+        for key in parameters
+        if key.endswith(".adc.trajectory")
+    ]
+    assert adc_paths
+
+    for adc_path in adc_paths:
+        assert parameters[f"{adc_path}.trajectory"]["script"] == "return {}"
+        assert parameters[f"{adc_path}.header.matrix_size"]["inputs"] == {
+            "mat_size": "root.mat_size"
+        }
+        assert parameters[f"{adc_path}.header.field_of_view"]["inputs"] == {
+            "fov": "root.fov"
+        }

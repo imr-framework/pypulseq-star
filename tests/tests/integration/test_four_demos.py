@@ -55,6 +55,7 @@ def test_demo_exports_files(filename: str, tmp_path: Path, monkeypatch) -> None:
 
     module = load_demo(demo_path)
     monkeypatch.chdir(tmp_path)
+
     module.main(plot=False, write_seq=True, write_json=True, debug=False)
 
     sequence_name = filename.removeprefix("demo_").removesuffix(".py").lower()

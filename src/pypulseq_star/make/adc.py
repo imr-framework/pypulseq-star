@@ -1,5 +1,8 @@
 """ADC constructors.
 
+All symbolic constructor values are resolved before numerical validation while
+the original expressions remain attached to the event.
+
 Public constructors
 -------------------
 make_adc(...)
@@ -29,6 +32,14 @@ from typing import Any
 from pypulseq_star.events.adc import SeqStarADCEvent
 from pypulseq_star.opts import Opts
 from pypulseq_star.shapes.adc import SeqStarADCTrainShape, SeqStarADCWindow
+from pypulseq_star.expressions import Expression
+from ._symbolic import (
+    attach_symbolic_specs,
+    resolve_float,
+    resolve_int,
+    resolve_string,
+    symbolic_specs,
+)
 
 
 def make_adc(
@@ -58,6 +69,17 @@ def make_adc(
 
     parameters = dict(parameters or {})
 
+    symbolic_event_specs = symbolic_specs(
+        num_samples=num_samples,
+        delay=delay,
+        duration=duration,
+        dwell=dwell,
+        freq_offset=freq_offset,
+        phase_offset=phase_offset,
+        freq_ppm=freq_ppm,
+        phase_ppm=phase_ppm,
+    )
+
     resolved_num_samples = _resolve_int_parameter(
         explicit_value=num_samples,
         parameters=parameters,
@@ -78,7 +100,7 @@ def make_adc(
     adc_dead_time = float(getattr(system, "adc_dead_time", 0.0))
     resolved_delay = max(resolved_delay, adc_dead_time)
 
-    return make_adc_train(
+    event = make_adc_train(
         num_samples=resolved_num_samples,
         dwell=dwell,
         duration=duration,
@@ -99,6 +121,9 @@ def make_adc(
         system=system,
         parameters=parameters,
     )
+    attach_symbolic_specs(event, symbolic_event_specs)
+    return event
+
 
 
 def make_adc_train(
@@ -140,6 +165,42 @@ def make_adc_train(
         system = Opts.default
 
     parameters = dict(parameters or {})
+
+    constructor_specs = {
+        "num_samples": num_samples,
+        "dwell": dwell,
+        "duration": duration,
+        "windows": tuple(dict(window) for window in windows) if windows is not None else None,
+        "num_echoes": num_echoes,
+        "first_delay": first_delay,
+        "echo_spacing": echo_spacing,
+        "mode": mode,
+        "polarity": polarity,
+        "trajectory": trajectory,
+        "freq_offset": freq_offset,
+        "phase_offset": phase_offset,
+        "freq_ppm": freq_ppm,
+        "phase_ppm": phase_ppm,
+        "dead_time": dead_time,
+        "window_guard_time": window_guard_time,
+        "adc_raster_time": adc_raster_time,
+    }
+
+    symbolic_train_specs = symbolic_specs(
+        num_samples=num_samples,
+        dwell=dwell,
+        duration=duration,
+        num_echoes=num_echoes,
+        first_delay=first_delay,
+        echo_spacing=echo_spacing,
+        freq_offset=freq_offset,
+        phase_offset=phase_offset,
+        freq_ppm=freq_ppm,
+        phase_ppm=phase_ppm,
+        dead_time=dead_time,
+        window_guard_time=window_guard_time,
+        adc_raster_time=adc_raster_time,
+    )
 
     resolved_mode = _resolve_string_parameter(
         explicit_value=mode,
@@ -344,6 +405,20 @@ def make_adc_train(
         windows=adc_windows,
     )
 
+    constructor_record = {
+        "family": (
+            "explicit_windows"
+            if constructor_specs.get("windows") is not None
+            else "regular_train"
+        ),
+        "specs": constructor_specs,
+    }
+    if isinstance(getattr(event, "metadata", None), dict):
+        event.metadata["symbolic_constructor"] = constructor_record
+    if isinstance(getattr(event, "parameters", None), dict):
+        event.parameters["_symbolic_constructor"] = constructor_record
+
+    attach_symbolic_specs(event, symbolic_train_specs)
     event.validate()
 
     return event
@@ -679,8 +754,8 @@ def _resolve_dwell_duration(
     protocol_dwell = _first_present(parameters, ("dwell", "adc_dwell", "sample_time"))
     protocol_duration = _first_present(parameters, ("duration", "adc_duration", "readout_duration"))
 
-    resolved_dwell = float(dwell if dwell is not None else protocol_dwell) if (dwell is not None or protocol_dwell is not None) else None
-    resolved_duration = float(duration if duration is not None else protocol_duration) if (duration is not None or protocol_duration is not None) else None
+    resolved_dwell = resolve_float(dwell if dwell is not None else protocol_dwell, field_name="dwell") if (dwell is not None or protocol_dwell is not None) else None
+    resolved_duration = resolve_float(duration if duration is not None else protocol_duration, field_name="ADC duration") if (duration is not None or protocol_duration is not None) else None
 
     if resolved_dwell is None and resolved_duration is None:
         raise ValueError("Exactly one of dwell or duration must be supplied for ADC.")
@@ -833,7 +908,7 @@ def _resolve_int_parameter(
     if value is None:
         raise ValueError(f"{name} must be supplied.")
 
-    value_int = int(value)
+    value_int = resolve_int(value, field_name=name)
 
     if value_int <= 0:
         raise ValueError(f"{name} must be positive. Passed: {value_int}")
@@ -851,14 +926,14 @@ def _resolve_float_parameter(
     """Resolve a float from explicit value, protocol keys, or default."""
 
     if explicit_value is not None:
-        return float(explicit_value)
+        return resolve_float(explicit_value, field_name=keys[0])
 
     protocol_value = _first_present(parameters, keys)
 
     if protocol_value is None:
         return float(default)
 
-    return float(protocol_value)
+    return resolve_float(protocol_value, field_name=keys[0])
 
 
 def _resolve_string_parameter(
@@ -871,14 +946,14 @@ def _resolve_string_parameter(
     """Resolve a string from explicit value, protocol keys, or default."""
 
     if explicit_value is not None:
-        return str(explicit_value)
+        return resolve_string(explicit_value, field_name=keys[0])
 
     protocol_value = _first_present(parameters, keys)
 
     if protocol_value is None:
         return default
 
-    return str(protocol_value)
+    return resolve_string(protocol_value, field_name=keys[0])
 
 
 def _first_present(parameters: Mapping[str, Any], keys: tuple[str, ...]) -> Any | None:

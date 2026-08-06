@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 
+from pypulseq_star.geometry import normalize_logical_axis
 from pypulseq_star.shapes.grad import (
     SeqStarArbitraryGradientShape,
     SeqStarGradientShape,
@@ -43,6 +44,18 @@ class SeqStarGradientEvent:
         if self.role is None:
             self.role = getattr(self.shape, "role", None)
 
+        logical_axis = normalize_logical_axis(
+            self.axis_role or self.encoding_role,
+            channel=getattr(self.shape, "channel", None),
+        )
+        if self.axis_role is None:
+            self.axis_role = logical_axis
+        if self.encoding_role is None:
+            self.encoding_role = logical_axis
+        if isinstance(self.metadata, dict):
+            self.metadata.setdefault("logical_axis", logical_axis)
+            self.metadata.setdefault("axis_role", logical_axis)
+
     @property
     def type(self) -> str:
         return getattr(self.shape, "kind", "grad")
@@ -50,6 +63,27 @@ class SeqStarGradientEvent:
     @property
     def channel(self) -> str:
         return getattr(self.shape, "channel")
+
+    @property
+    def logical_axis(self) -> str:
+        """Logical read/phase/slice axis, independent of physical channel."""
+        value = None
+        for candidate in (self.axis_role, self.encoding_role):
+            if candidate is not None:
+                value = candidate
+                break
+        if value is None and isinstance(self.metadata, dict):
+            value = self.metadata.get("logical_axis") or self.metadata.get("axis_role")
+        return normalize_logical_axis(value, channel=self.channel)
+
+    @property
+    def physical_direction(self) -> tuple[float, float, float]:
+        """Physical x/y/z direction cosine vector assigned by the sequence."""
+        value = self.metadata.get("physical_direction") if isinstance(self.metadata, dict) else None
+        if isinstance(value, (list, tuple)) and len(value) == 3:
+            return tuple(float(v) for v in value)
+        base={"x":(1.0,0.0,0.0),"y":(0.0,1.0,0.0),"z":(0.0,0.0,1.0)}
+        return base.get(self.channel, (1.0,0.0,0.0))
 
     @property
     def delay(self) -> float:
@@ -305,6 +339,8 @@ class SeqStarGradientEvent:
             "name": self.name,
             "type": self.type,
             "channel": self.channel,
+            "logical_axis": self.logical_axis,
+            "physical_direction": list(self.physical_direction),
             "delay": self.delay,
             "duration": self.duration,
             "active_duration": self.active_duration,
@@ -334,6 +370,8 @@ class SeqStarGradientEvent:
         return {
             "kind": self.type,
             "channel": self.channel,
+            "logical_axis": self.logical_axis,
+            "physical_direction": list(self.physical_direction),
             "tstart": self.delay,
             "duration": self.duration,
             "active_duration": self.active_duration,

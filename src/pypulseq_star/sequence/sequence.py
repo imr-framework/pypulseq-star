@@ -10,10 +10,27 @@ from typing import Any
 from pypulseq_star.blocks import SeqStarBlock
 from pypulseq_star.core import SeqStarNode, SeqStarRelationship
 from pypulseq_star.opts import Opts
+from pypulseq_star.geometry import EncodingFrame
 from pypulseq_star.check_timing import check_timing
 from pypulseq_star.calc_duration import calc_duration as _shared_calc_duration
+from pypulseq_star.expressions import (
+    AnchorIntervalDurationRef,
+    BlockRangeDurationRef,
+    EvaluationContext,
+    EventAnchorRef,
+    Expression,
+    LiteralExpression,
+    ReferenceExpression,
+    as_expression,
+    ExpressionDiagnostic,
+    ExpressionEvaluationError,
+    RangeValidationError,
+    TypeValidationError,
+    UnknownReferenceError,
+)
 from pypulseq_star.plotting.plotter import plot
 from .timeline import SeqStarTimeline, split_node_path
+from .vary import SeqStarNodeHandle, SeqStarVariation
 
 
 def _safe_setattr(obj: Any, name: str, value: Any) -> None:
@@ -38,6 +55,46 @@ def _metadata_value(obj: Any, key: str, default: Any = None) -> Any:
 
     return getattr(obj, key, default)
 
+
+def _stable_event_uid(
+    *,
+    sequence_name: str,
+    block_index: int,
+    event_index: int,
+    event_path: str,
+) -> str:
+    """Return a deterministic event-occurrence identifier.
+
+    The identifier is independent of Python object identity and therefore
+    survives deepcopy(), numeric realization, and writer-side event proxies.
+    """
+
+    return (
+        f"{sequence_name}::block[{int(block_index)}]"
+        f"::event[{int(event_index)}]::{event_path}"
+    )
+
+
+
+def _gradient_logical_axis(event: Any) -> str | None:
+    """Return read/phase/slice semantics for a gradient-like event."""
+    if event is None or not hasattr(event, "channel"):
+        return None
+    for value in (
+        getattr(event, "axis_role", None),
+        getattr(event, "encoding_role", None),
+    ):
+        if str(value or "").lower() in {"read", "phase", "slice"}:
+            return str(value).lower()
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, dict):
+        value = metadata.get("logical_axis") or metadata.get("axis_role")
+        if str(value or "").lower() in {"read", "phase", "slice"}:
+            return str(value).lower()
+    # Compatibility fallback: the PyPulseq channel remains meaningful when no
+    # logical semantic has been declared.
+    channel = str(getattr(event, "channel", "")).lower()
+    return {"x":"read", "y":"phase", "z":"slice"}.get(channel)
 
 @dataclass(slots=True)
 class SeqStarSequence(SeqStarNode):
@@ -71,25 +128,43 @@ class SeqStarSequence(SeqStarNode):
     """
 
     system: Opts = field(default_factory=Opts)
+    protocol: Any | None = None
     timeline: SeqStarTimeline = field(default_factory=SeqStarTimeline)
     debug: bool = False
 
     def __init__(
         self,
         system: Opts | None = None,
-        name: str | None = None,
+        name: str | Expression | None = None,
         parameters: dict[str, object] | None = None,
         *,
+        protocol: Any | None = None,
         debug: bool | None = None,
     ) -> None:
-        """Create an enriched PyPulseq-Star sequence."""
+        """Create an enriched PyPulseq-Star sequence.
+
+        ``protocol`` is the preferred Phase 2 source of sequence parameters.
+        ``parameters`` remains supported for backward compatibility. When both
+        are supplied, explicit ``parameters`` override protocol defaults.
+        """
 
         system = system or Opts()
-        sequence_name = name or "seqstar_sequence"
-        sequence_parameters = dict(parameters or {})
         debug_enabled = self._debug_env_enabled() if debug is None else bool(debug)
 
+        sequence_parameters: dict[str, object] = {}
+        protocol_parameters = getattr(protocol, "parameters", None)
+        if isinstance(protocol_parameters, dict):
+            sequence_parameters.update(protocol_parameters)
+        sequence_parameters.update(dict(parameters or {}))
+
+        sequence_name = self._resolve_initial_name(
+            name=name,
+            protocol=protocol,
+            parameters=sequence_parameters,
+        )
+
         self.system = system
+        self.protocol = protocol
         self.timeline = SeqStarTimeline(debug=debug_enabled)
         self.debug = debug_enabled
 
@@ -126,11 +201,106 @@ class SeqStarSequence(SeqStarNode):
             self.metadata.setdefault("seqstar_nodes", self.timeline.nodes)
             self.metadata.setdefault("seqstar_debug", debug_enabled)
             self.metadata.setdefault("seqstar_timeline_version", "node-metadata-phase1-block-after")
+            self.metadata.setdefault("protocol_object", protocol)
+            self.metadata.setdefault("phase2_expression_contract", True)
+            self.metadata.setdefault("encoding_frame", EncodingFrame.identity().to_dict())
+
+        # Generic protocol-driven orientation initialization. Protocol normalizes
+        # the public alias ``orientation`` to the canonical
+        # ``slice_orientation`` key. Initializing the encoding frame here keeps
+        # every sequence, plotter, and writer consistent even when a demo does
+        # not call set_encoding_frame() explicitly.
+        protocol_orientation = None
+        if protocol is not None:
+            get_parameter = getattr(protocol, "get_parameter", None)
+            if callable(get_parameter):
+                protocol_orientation = get_parameter("slice_orientation", None)
+            elif isinstance(protocol_parameters, dict):
+                protocol_orientation = protocol_parameters.get(
+                    "slice_orientation", protocol_parameters.get("orientation")
+                )
+
+        if protocol_orientation is not None:
+            self.set_encoding_frame(str(protocol_orientation))
 
         self._debug(
             f"created sequence name={sequence_name!r} debug={debug_enabled} "
             f"parameters={len(sequence_parameters)}"
         )
+
+    @staticmethod
+    def _resolve_initial_name(
+        *,
+        name: str | Expression | None,
+        protocol: Any | None,
+        parameters: dict[str, object],
+    ) -> str:
+        """Resolve a sequence name without discarding its symbolic source."""
+
+        if isinstance(name, Expression):
+            try:
+                return str(name.eval(protocol or parameters))
+            except Exception:
+                return name.to_canonical()
+
+        if name is not None:
+            return str(name)
+
+        if protocol is not None:
+            protocol_name = getattr(protocol, "name", None)
+            if protocol_name:
+                return str(protocol_name)
+
+        candidate = parameters.get("sequence_name") or parameters.get("Name")
+        return str(candidate or "seqstar_sequence")
+
+    @property
+    def symbols(self):
+        """Return the symbolic protocol namespace attached to this sequence."""
+
+        if self.protocol is None:
+            raise AttributeError(
+                "This sequence has no Protocol object. Construct it with "
+                "Sequence(protocol=protocol, ...)."
+            )
+        return self.protocol.symbols
+
+    def set_encoding_frame(
+        self,
+        frame: EncodingFrame | str | list[list[float]] | tuple[tuple[float, ...], ...] = "axial",
+        *,
+        position: tuple[float, float, float] | None = None,
+        name: str | None = None,
+    ) -> EncodingFrame:
+        """Set the logical read/phase/slice frame used by all writers.
+
+        Gradient constructors remain PyPulseq-compatible and continue to use
+        physical ``channel="x"|"y"|"z"``. The event's ``axis_role``
+        declares its logical read/phase/slice meaning; this frame maps that
+        logical meaning to physical scanner axes.
+        """
+        resolved = EncodingFrame.from_value(frame, position=position, name=name)
+        if not isinstance(self.metadata, dict):
+            raise TypeError("Sequence metadata is unavailable.")
+        frame_dict = resolved.to_dict()
+        self.metadata["encoding_frame"] = frame_dict
+        self.metadata["encoding_rotation"] = frame_dict["rotation"]
+        self.metadata["image_transform"] = frame_dict["transform4x4"]
+        self.metadata["encoding_read_dir"] = frame_dict["read_dir"]
+        self.metadata["encoding_phase_dir"] = frame_dict["phase_dir"]
+        self.metadata["encoding_slice_dir"] = frame_dict["slice_dir"]
+        return resolved
+
+    @property
+    def encoding_frame(self) -> EncodingFrame:
+        value = self.metadata.get("encoding_frame") if isinstance(self.metadata, dict) else None
+        if isinstance(value, dict):
+            return EncodingFrame.from_value(
+                value.get("rotation", ((1,0,0),(0,1,0),(0,0,1))),
+                position=value.get("position", (0,0,0)),
+                name=value.get("name", "encoding"),
+            )
+        return EncodingFrame.identity()
 
     @staticmethod
     def _debug_env_enabled() -> bool:
@@ -155,12 +325,13 @@ class SeqStarSequence(SeqStarNode):
         name: str,
         *,
         role: str | None = None,
-        repeat_every: str | float | None = None,
-        repeat_count: str | int | None = None,
+        repeat_every: str | float | Expression | None = None,
+        repeat_count: str | int | Expression | None = None,
+        factor: str | int | Expression | None = None,
         counter: str | None = None,
         repeat_mode: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> SeqStarNodeHandle:
         """Register or update a SeqStar hierarchy node.
 
         This is the first implementation step toward using ``seq.add_block`` as
@@ -173,6 +344,13 @@ class SeqStarSequence(SeqStarNode):
         The public API intentionally avoids a separate ``parent`` argument for
         normal use; parentage is derived from the dotted node path.
         """
+
+        if factor is not None:
+            if repeat_count is not None:
+                raise ValueError(
+                    "Use either factor= or repeat_count=, not both."
+                )
+            repeat_count = factor
 
         record = self.timeline.set_node(
             name,
@@ -193,7 +371,73 @@ class SeqStarSequence(SeqStarNode):
             f"repeat_count={record.get('repeat_count')!r} counter={record.get('counter')!r} "
             f"repeat_mode={record.get('repeat_mode')!r}"
         )
-        return record
+        return SeqStarNodeHandle(self, str(record["name"]))
+
+    def _register_node_variation(
+        self,
+        node_name: str,
+        specification: SeqStarVariation,
+    ) -> None:
+        """Register a declarative loop variation on a hierarchy node."""
+
+        record = self.timeline.get_node(node_name)
+        if record is None:
+            raise KeyError(f"Unknown sequence node {node_name!r}.")
+
+        factor = record.get("repeat_count")
+        counter = record.get("counter") or f"{record.get('local_name', 'loop')}_index"
+        repeat_mode = record.get("repeat_mode")
+
+        if factor is None:
+            raise ValueError(
+                f"Node {node_name!r} must define factor= or repeat_count= "
+                "before variations can be attached."
+            )
+        if repeat_mode != "loop":
+            raise ValueError(
+                f"Node {node_name!r} variations require repeat_mode='loop'. "
+                "Use an ordinary Python for-loop for expanded hardcoded values."
+            )
+
+        variation_record = specification.to_record(
+            node=node_name,
+            counter=str(counter),
+            factor=factor,
+        )
+        record.setdefault("variations", []).append(variation_record)
+
+        for event in specification.events:
+            binding = dict(variation_record)
+            binding["event_name"] = str(
+                getattr(event, "name", None)
+                or getattr(event, "path", None)
+                or event.__class__.__name__
+            )
+            binding["event_object_id"] = id(event)
+
+            metadata = getattr(event, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata.setdefault("seqstar_variations", []).append(binding)
+                # Compatibility bridge for current gammaSTAR writer paths.
+                metadata["seqstar_loop_binding"] = binding
+                metadata["seqstar_nested_loop_binding"] = binding
+            else:
+                try:
+                    setattr(event, "_seqstar_loop_binding", binding)
+                except Exception:
+                    pass
+
+            parameters = getattr(event, "parameters", None)
+            if isinstance(parameters, dict):
+                parameters.setdefault("_seqstar_variations", []).append(binding)
+
+        if hasattr(self, "metadata") and isinstance(self.metadata, dict):
+            self.metadata["seqstar_nodes"] = self.timeline.nodes
+
+        self._debug(
+            f"vary node={node_name!r} attribute={specification.attribute!r} "
+            f"events={len(specification.events)} mode={specification.mode!r}"
+        )
 
     def get_node(self, name: str) -> dict[str, Any] | None:
         """Return a registered hierarchy node record, if present."""
@@ -542,6 +786,12 @@ class SeqStarSequence(SeqStarNode):
             block_index=block_index,
             event_index=event_index,
         )
+        event_uid = _stable_event_uid(
+            sequence_name=str(self.name),
+            block_index=block_index,
+            event_index=event_index,
+            event_path=event_path,
+        )
 
         self._ensure_node_debug_fields(
             occurrence,
@@ -572,6 +822,12 @@ class SeqStarSequence(SeqStarNode):
                 parent_node=block_parent,
                 local_name=str(getattr(occurrence, "name", None) or f"event_{event_index:03d}"),
             )
+            event_uid = _stable_event_uid(
+                sequence_name=str(self.name),
+                block_index=block_index,
+                event_index=event_index,
+                event_path=event_path,
+            )
 
         metadata = getattr(occurrence, "metadata", None)
         if isinstance(metadata, dict):
@@ -584,6 +840,7 @@ class SeqStarSequence(SeqStarNode):
             metadata["sequence_block_name"] = getattr(block, "name", None)
             metadata["sequence_block_role"] = block_role
             metadata["sequence_event_path"] = event_path
+            metadata["seqstar_event_uid"] = event_uid
             metadata["path"] = event_path
             metadata["sequence_block_node"] = block_node
             metadata["sequence_block_parent"] = block_parent
@@ -596,6 +853,12 @@ class SeqStarSequence(SeqStarNode):
             metadata["seqstar_role"] = block_role
             metadata["seqstar_varies"] = list(block_varies)
             metadata["is_copied_occurrence"] = occurrence is not source_event
+            logical_axis = _gradient_logical_axis(occurrence)
+            if logical_axis is not None:
+                direction = self.encoding_frame.direction(logical_axis)
+                metadata["logical_axis"] = logical_axis
+                metadata["physical_direction"] = list(direction)
+                metadata["encoding_frame"] = self.encoding_frame.to_dict()
 
         parameters = getattr(occurrence, "parameters", None)
         if isinstance(parameters, dict):
@@ -606,6 +869,7 @@ class SeqStarSequence(SeqStarNode):
             parameters["sequence_block_index"] = block_index
             parameters["sequence_event_index"] = event_index
             parameters["sequence_event_path"] = event_path
+            parameters["seqstar_event_uid"] = event_uid
             parameters["path"] = event_path
             parameters["sequence_block_role"] = block_role
             parameters["sequence_block_node"] = block_node
@@ -619,6 +883,12 @@ class SeqStarSequence(SeqStarNode):
             parameters["seqstar_role"] = block_role
             parameters["seqstar_varies"] = list(block_varies)
             parameters["is_copied_occurrence"] = occurrence is not source_event
+            logical_axis = _gradient_logical_axis(occurrence)
+            if logical_axis is not None:
+                parameters["logical_axis"] = logical_axis
+                parameters["physical_direction"] = list(
+                    self.encoding_frame.direction(logical_axis)
+                )
 
     def add_repeating_block(
         self,
@@ -711,11 +981,14 @@ class SeqStarSequence(SeqStarNode):
         return block
 
     def get_protocol_parameter(self, *keys: str, default: Any = None) -> Any:
-        """Return the first matching protocol/sequence parameter.
+        """Return the first matching canonical or aliased protocol parameter."""
 
-        This allows callers to use either canonical protocol keys or older
-        PyPulseq-style shorthand keys.
-        """
+        if self.protocol is not None and hasattr(self.protocol, "get_parameter"):
+            sentinel = object()
+            for key in keys:
+                value = self.protocol.get_parameter(key, sentinel)
+                if value is not sentinel:
+                    return value
 
         for key in keys:
             if key in self.parameters:
@@ -724,9 +997,16 @@ class SeqStarSequence(SeqStarNode):
         return default
 
     def set_protocol_parameter(self, key: str, value: Any) -> None:
-        """Set or update a sequence-level protocol parameter."""
+        """Set a protocol parameter and keep the compatibility snapshot aligned."""
 
-        self.parameters[key] = value
+        canonical_key = key
+        if self.protocol is not None:
+            if hasattr(self.protocol, "canonical_name"):
+                canonical_key = self.protocol.canonical_name(key)
+            if hasattr(self.protocol, "set_parameter"):
+                self.protocol.set_parameter(canonical_key, value)
+
+        self.parameters[canonical_key] = value
 
     def system_dict(self) -> dict[str, Any]:
         """Return the system dictionary, if supported by Opts."""
@@ -737,8 +1017,11 @@ class SeqStarSequence(SeqStarNode):
         return dict(vars(self.system))
 
     def protocol_dict(self) -> dict[str, Any]:
-        """Return sequence-level protocol parameters."""
+        """Return canonical parameters from the central Protocol when present."""
 
+        protocol_parameters = getattr(self.protocol, "parameters", None)
+        if isinstance(protocol_parameters, dict):
+            return dict(protocol_parameters)
         return dict(self.parameters)
 
     def context_dict(self) -> dict[str, Any]:
@@ -818,6 +1101,363 @@ class SeqStarSequence(SeqStarNode):
         """Return a Pulseq-style sequence definition."""
 
         return self.parameters.get(key, default)
+
+    def block(self, name: str) -> SeqStarBlock:
+        """Return one timeline block by its public name or node path."""
+
+        requested = str(name)
+        for block in self.timeline.blocks:
+            candidates = {
+                str(getattr(block, "name", "")),
+                str(_metadata_value(block, "seqstar_node", "")),
+                str(_metadata_value(block, "seqstar_local_name", "")),
+            }
+            if requested in candidates:
+                return block
+        raise UnknownReferenceError(
+            f"Unknown sequence block {requested!r}.",
+            diagnostic=ExpressionDiagnostic(
+                code="UNKNOWN_BLOCK",
+                message=f"Unknown sequence block {requested!r}.",
+                property_path=requested,
+                stage="sequence_lookup",
+            ),
+        )
+
+    def event(self, name: str) -> Any:
+        """Return the first event occurrence matching a name or path."""
+
+        requested = str(name)
+        for block in self.timeline.blocks:
+            events = getattr(block, "events", None)
+            if isinstance(events, dict):
+                iterable = events.values()
+            elif isinstance(events, (list, tuple)):
+                iterable = events
+            else:
+                try:
+                    iterable = list(events or [])
+                except Exception:
+                    iterable = []
+
+            for event in iterable:
+                candidates = {
+                    str(getattr(event, "name", "")),
+                    str(getattr(event, "path", "")),
+                    str(_metadata_value(event, "sequence_event_path", "")),
+                }
+                if requested in candidates:
+                    return event
+
+        raise UnknownReferenceError(
+            f"Unknown sequence event {requested!r}.",
+            diagnostic=ExpressionDiagnostic(
+                code="UNKNOWN_EVENT",
+                message=f"Unknown sequence event {requested!r}.",
+                property_path=requested,
+                stage="sequence_lookup",
+            ),
+        )
+
+    def node(self, name: str) -> Any:
+        """Return a hierarchy node record.
+
+        A future resolved realization will expose a numeric node object through
+        the same method. The symbolic sequence currently returns the timeline
+        node record.
+        """
+
+        record = self.get_node(name)
+        if record is None:
+            raise UnknownReferenceError(
+                f"Unknown sequence node {name!r}.",
+                diagnostic=ExpressionDiagnostic(
+                    code="UNKNOWN_NODE",
+                    message=f"Unknown sequence node {name!r}.",
+                    property_path=str(name),
+                    stage="sequence_lookup",
+                ),
+            )
+        return record
+
+    def duration(
+        self,
+        item: Any = None,
+        *,
+        start: EventAnchorRef | None = None,
+        end: EventAnchorRef | None = None,
+        start_block_name: str | None = None,
+        end_block_name: str | None = None,
+    ) -> Expression:
+        """Return a symbolic duration expression through one unified API.
+
+        Supported forms
+        ---------------
+        ``seq.duration(event_or_block)``
+        ``seq.duration([event_or_block, ...])``
+        ``seq.duration(start=event.anchor(...), end=event.anchor(...))``
+        ``seq.duration(start_block_name="a", end_block_name="b")``
+
+        Named block ranges are inclusive. Anchor intervals and named block
+        ranges remain deferred references until evaluated against this sequence
+        or a resolved realization.
+        """
+
+        has_anchor_range = start is not None or end is not None
+        has_block_range = (
+            start_block_name is not None or end_block_name is not None
+        )
+
+        mode_count = sum(
+            (
+                item is not None,
+                has_anchor_range,
+                has_block_range,
+            )
+        )
+        if mode_count != 1:
+            raise ValueError(
+                "duration() requires exactly one of: item, start/end anchors, "
+                "or start_block_name/end_block_name."
+            )
+
+        if has_anchor_range:
+            if start is None or end is None:
+                raise ValueError("Both start and end anchors are required.")
+            if not isinstance(start, EventAnchorRef) or not isinstance(end, EventAnchorRef):
+                raise TypeValidationError(
+                    "start and end must be EventAnchorRef objects produced by event.anchor(...).",
+                    diagnostic=ExpressionDiagnostic(
+                        code="INVALID_DURATION_ENDPOINT_TYPE",
+                        message=(
+                            "start and end must be EventAnchorRef objects produced "
+                            "by event.anchor(...)."
+                        ),
+                        stage="duration_construction",
+                    ),
+                )
+            return AnchorIntervalDurationRef(start, end)
+
+        if has_block_range:
+            if start_block_name is None or end_block_name is None:
+                raise ValueError(
+                    "Both start_block_name and end_block_name are required."
+                )
+            # Validate names and order immediately, but defer numeric evaluation.
+            start_index = self._block_index(start_block_name)
+            end_index = self._block_index(end_block_name)
+            if end_index < start_index:
+                raise RangeValidationError(
+                    "end_block_name precedes start_block_name in the timeline.",
+                    diagnostic=ExpressionDiagnostic(
+                        code="REVERSED_BLOCK_RANGE",
+                        message="end_block_name precedes start_block_name in the timeline.",
+                        property_path=f"{start_block_name}->{end_block_name}",
+                        constraint="start index <= end index",
+                        stage="duration_construction",
+                    ),
+                )
+            return BlockRangeDurationRef(
+                str(start_block_name),
+                str(end_block_name),
+            )
+
+        if isinstance(item, Expression):
+            return item
+
+        if isinstance(item, (list, tuple)):
+            if not item:
+                return LiteralExpression(0.0)
+            return ReferenceExpression(
+                kind="item_group_duration",
+                identity="group:" + ",".join(str(id(value)) for value in item),
+                property_name="duration",
+                metadata={"items": tuple(item)},
+            )
+
+        return ReferenceExpression(
+            kind="item_duration",
+            identity=self._object_expression_identity(item),
+            property_name="duration",
+            metadata={"item": item},
+        )
+
+    def _object_expression_identity(self, obj: Any) -> str:
+        name = getattr(obj, "name", None) or getattr(obj, "path", None)
+        return str(name or f"{obj.__class__.__name__}:{id(obj)}")
+
+    def _block_index(self, name: str) -> int:
+        target = self.block(name)
+        for index, block in enumerate(self.timeline.blocks):
+            if block is target:
+                return index
+        raise KeyError(f"Unknown sequence block {name!r}.")
+
+    def resolve_expression_reference(
+        self,
+        kind: str,
+        identity: str,
+        property_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
+        """Resolve a deferred expression reference against the current sequence.
+
+        This is the bridge used by ``Expression.eval(seq)``. It intentionally
+        implements only general duration semantics and contains no FID-, GRE-,
+        EPI-, or TSE-specific logic.
+        """
+
+        metadata = dict(metadata or {})
+
+        if kind == "item_duration":
+            return self._numeric_item_duration(metadata.get("item"))
+
+        if kind == "item_group_duration":
+            items = metadata.get("items", ())
+            return self._numeric_group_duration(items)
+
+        if kind == "block_range_duration":
+            start_name = metadata["start_block_name"]
+            end_name = metadata["end_block_name"]
+            start_index = self._block_index(start_name)
+            end_index = self._block_index(end_name)
+            blocks = self.timeline.blocks[start_index : end_index + 1]
+            return self.calc_timeline_duration(blocks)
+
+        if kind == "anchor_interval_duration":
+            start_ref = metadata["start"]
+            end_ref = metadata["end"]
+            return self._numeric_anchor_interval(start_ref, end_ref)
+
+        if kind == "event_anchor":
+            event = self._event_for_anchor_reference(identity, metadata)
+            return self._numeric_event_anchor(event, str(property_name))
+
+        if kind == "event_property":
+            event = self._event_for_anchor_reference(identity, metadata)
+            value = getattr(event, str(property_name))
+            if isinstance(value, Expression):
+                return value.eval(self)
+            return value
+
+        raise UnknownReferenceError(
+            f"Unsupported expression reference kind {kind!r} ({identity!r}).",
+            diagnostic=ExpressionDiagnostic(
+                code="UNSUPPORTED_REFERENCE_KIND",
+                message=f"Unsupported expression reference kind {kind!r}.",
+                property_path=identity,
+                expression=f"{kind}:{identity}:{property_name}",
+                stage="reference_resolution",
+            ),
+        )
+
+    def _numeric_item_duration(self, item: Any) -> float:
+        if item is None:
+            return 0.0
+        if isinstance(item, Expression):
+            return float(item.eval(self))
+        return float(_shared_calc_duration(item))
+
+    def _numeric_group_duration(self, items: Any) -> float:
+        """Return simultaneous occupied extent of an explicit item group.
+
+        A list or tuple passed to ``seq.duration([...])`` represents events
+        placed in the same Pulseq block. Its occupied duration is therefore the
+        maximum event extent, not the sum. Sequential block ranges are handled
+        separately by ``calc_timeline_duration`` and block-range expressions.
+        """
+
+        numeric_items = [
+            self._numeric_item_duration(item)
+            for item in items
+            if item is not None
+        ]
+        return max(numeric_items, default=0.0)
+
+    def _event_for_anchor_reference(
+        self,
+        identity: str,
+        metadata: dict[str, Any],
+    ) -> Any:
+        event = metadata.get("event")
+        if event is not None:
+            return event
+        return self.event(identity)
+
+    def _numeric_event_anchor(self, event: Any, anchor: str) -> float:
+        anchor_name = str(anchor).strip().lower()
+        delay = self._event_delay(event)
+        active = self._event_active_duration(event)
+
+        if anchor_name in {"origin", "event_origin"}:
+            return 0.0
+        if anchor_name in {"start", "active_start"}:
+            return delay
+        if anchor_name == "center":
+            if self._is_rf_event(event):
+                return float(self.calc_rf_center(event)[0])
+            return delay + 0.5 * active
+        if anchor_name in {"end", "active_end"}:
+            return delay + active
+
+        raise ValueError(
+            f"Unknown event anchor {anchor!r}; expected origin, start, center, or end."
+        )
+
+    def _numeric_anchor_interval(
+        self,
+        start_ref: EventAnchorRef,
+        end_ref: EventAnchorRef,
+    ) -> float:
+        """Return fixed intrinsic occupancy between two unplaced event anchors.
+
+        For the Phase 2 construction pattern used by FID, the start and end
+        events may not yet be in the timeline. The fixed occupancy is therefore
+        the remaining extent of the start event plus the leading extent of the
+        end event.
+        """
+
+        start_metadata = dict(start_ref.metadata)
+        end_metadata = dict(end_ref.metadata)
+        start_event = self._event_for_anchor_reference(
+            start_ref.identity,
+            start_metadata,
+        )
+        end_event = self._event_for_anchor_reference(
+            end_ref.identity,
+            end_metadata,
+        )
+
+        start_anchor = self._numeric_event_anchor(
+            start_event,
+            str(start_ref.property_name),
+        )
+        start_extent = self._event_time_extent(start_event)
+        end_anchor = self._numeric_event_anchor(
+            end_event,
+            str(end_ref.property_name),
+        )
+
+        return (start_extent - start_anchor) + end_anchor
+
+    @staticmethod
+    def _is_rf_event(event: Any) -> bool:
+        event_type = str(
+            getattr(event, "type", getattr(event, "kind", ""))
+        ).lower()
+        class_name = event.__class__.__name__.lower()
+        return event_type == "rf" or "rf" in class_name
+
+    def resolve(self, **overrides: Any):
+        """Create an immutable-style numeric realization.
+
+        Keyword arguments override canonical protocol parameters for this
+        realization only. The symbolic source sequence is not mutated.
+        """
+
+        from pypulseq_star.resolution import resolve_sequence
+
+        return resolve_sequence(self, overrides=overrides)
 
     def calc_duration(self, *events: Any) -> float:
         """Return the occupied duration of one or more simultaneous events.

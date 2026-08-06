@@ -27,8 +27,10 @@ pip-wheel-metadata/
 .coverage
 .coverage.*
 coverage.xml
+coverage.json
+coverage.lcov
 htmlcov/
-.pytest_cache/
+.coverage_data/
 
 # Type-checking and profiling output
 *.prof
@@ -78,7 +80,7 @@ outputs/
 !docs/**/*.pdf
 !examples/**/*.json
 
-# Local logs and temporary files
+# Local logs, caches, and temporary files
 *.log
 *.tmp
 *.temp

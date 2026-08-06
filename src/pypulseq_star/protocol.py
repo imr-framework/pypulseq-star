@@ -56,6 +56,7 @@ class Protocol:
     name: str
     description: str = ""
     parameters: dict[str, Any] = field(default_factory=dict)
+    aliases: dict[str, str] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     strict: bool = False
@@ -500,10 +501,12 @@ class Protocol:
     }
 
     def __post_init__(self) -> None:
-        self.parameters = self._normalize_parameters(self.parameters)
+        self.aliases = dict(self.aliases)
+        self.parameters = self._normalize_parameters(dict(self.parameters))
+        self._validate_aliases()
 
     @classmethod
-    def aliases(cls) -> dict[str, str]:
+    def built_in_aliases(cls) -> dict[str, str]:
         """
         Return alias-to-canonical-key mapping.
         """
@@ -514,19 +517,61 @@ class Protocol:
                 alias_map[alias] = key
         return alias_map
 
+    def alias_map(self) -> dict[str, str]:
+        """Return built-in aliases merged with protocol-specific overrides."""
+        merged = self.built_in_aliases()
+        merged.update(self.aliases)
+
+        for canonical_name in self.parameters:
+            merged.setdefault(canonical_name, canonical_name)
+
+        return merged
+
+    def canonical_name(self, key: str) -> str:
+        """Return the canonical parameter name for a key or alias."""
+        return self.alias_map().get(key, key)
+
+    @property
+    def symbols(self):
+        """Return symbolic references to protocol parameters."""
+        from pypulseq_star.expressions import ParameterNamespace
+
+        namespace = getattr(self, "_symbols_namespace", None)
+        if namespace is None:
+            namespace = ParameterNamespace(self, aliases=self.alias_map())
+            self._symbols_namespace = namespace
+        return namespace
+
+    @classmethod
+    def parameter_spec(cls, key: str) -> ProtocolParameterSpec | None:
+        """Compatibility alias used by the symbolic parameter namespace."""
+        return cls.get_spec(key)
+
     @classmethod
     def get_spec(cls, key: str) -> ProtocolParameterSpec | None:
         """
         Return the parameter specification for a canonical key or alias.
         """
-        canonical_key = cls.aliases().get(key, key)
+        canonical_key = cls.built_in_aliases().get(key, key)
         return cls.PARAMETER_SPECS.get(canonical_key)
+
+    def _validate_aliases(self) -> None:
+        """Validate protocol-specific alias targets when strict mode is enabled."""
+        if not self.strict:
+            return
+
+        for alias, canonical_name in self.aliases.items():
+            if canonical_name not in self.PARAMETER_SPECS:
+                raise KeyError(
+                    f"Alias {alias!r} targets unknown protocol parameter "
+                    f"{canonical_name!r} while strict=True."
+                )
 
     def _normalize_parameters(self, parameters: dict[str, Any]) -> dict[str, Any]:
         """
         Convert aliases such as TR, TE, FA, and TI to canonical keys.
         """
-        alias_map = self.aliases()
+        alias_map = self.alias_map()
         normalized: dict[str, Any] = {}
 
         for key, value in parameters.items():
@@ -548,7 +593,7 @@ class Protocol:
 
         Aliases are accepted. Unknown parameters are accepted unless strict=True.
         """
-        canonical_key = self.aliases().get(key, key)
+        canonical_key = self.alias_map().get(key, key)
 
         if self.strict and canonical_key not in self.PARAMETER_SPECS:
             raise KeyError(
@@ -562,14 +607,14 @@ class Protocol:
         """
         Get a protocol parameter by canonical key or alias.
         """
-        canonical_key = self.aliases().get(key, key)
+        canonical_key = self.alias_map().get(key, key)
         return self.parameters.get(canonical_key, default)
 
     def remove_parameter(self, key: str) -> None:
         """
         Remove a protocol parameter by canonical key or alias.
         """
-        canonical_key = self.aliases().get(key, key)
+        canonical_key = self.alias_map().get(key, key)
         self.parameters.pop(canonical_key, None)
 
     def group_for_parameter(self, key: str) -> str:
@@ -766,6 +811,7 @@ class Protocol:
             "Protocol("
             f"name={self.name!r}, "
             f"description={self.description!r}, "
-            f"parameters={self.parameters!r}"
+            f"parameters={self.parameters!r}, "
+            f"aliases={self.aliases!r}"
             ")"
         )

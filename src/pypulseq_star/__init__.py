@@ -16,6 +16,7 @@ from pypulseq_star.make import (
     make_delay,
 )
 from pypulseq_star.opts import Opts
+from pypulseq_star.geometry import EncodingFrame
 from pypulseq_star.plotting.plotter import SeqStarPlotter, plot
 from pypulseq_star.plotting.relationship_grapher import (
     RelationshipGrapher,
@@ -26,13 +27,30 @@ from pypulseq_star.plotting.relationship_grapher import (
     write_relationship_graph_mermaid,
 )
 from pypulseq_star.protocol import Protocol
+from pypulseq_star.expressions import (
+    EvaluationContext,
+    Expression,
+    ParameterNamespace,
+    ParameterRef,
+)
 from pypulseq_star.sequence import SeqStarSequence as Sequence
 
-__version__ = "0.1.0a1"
+from pypulseq_star.feasibility import (
+    evaluate_feasibility,
+    feasible_range,
+    sweep_parameters,
+)
+
+__version__ = "0.2.0a1"
 # PyPulseq-compatible numerical tolerance.
 eps = 1e-12
 
 __all__ = [
+    "EncodingFrame",
+    "EvaluationContext",
+    "Expression",
+    "ParameterNamespace",
+    "ParameterRef",
     "Opts",
     "Protocol",
     "RelationshipGrapher",
@@ -48,6 +66,9 @@ __all__ = [
     "make_trapezoid",
     "make_delay",
     "plot",
+    "sweep_parameters",
+    "feasible_range",
+    "evaluate_feasibility",
     "relationship_graph_text",
     "relationships",
     "split_gradient",

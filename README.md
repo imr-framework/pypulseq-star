@@ -1,135 +1,196 @@
 # PyPulseq-Star
 
-PyPulseq-Star is an experimental Python framework for MRI pulse-sequence development that combines a familiar PyPulseq-style scripting workflow with a richer representation of sequence hierarchy, protocol parameters, timing relationships, and loop structure.
+PyPulseq-Star is an evolution of the PyPulseq-style sequence-development workflow for applications that require retained protocol intent, explicit relationships, and more than one output representation. It preserves familiar Python-first construction while enriching the sequence model with protocol parameters, symbolic dependencies, hierarchy, timing relationships, loops, orientation, validation, and backend-specific export semantics.
 
-The same sequence description can be used to produce:
+The project does not replace PyPulseq or redefine the Pulseq standard. Instead, it extends the authoring model around them: a PyPulseq-like script is used to construct a relationship-aware internal representation that can be resolved into a conventional Pulseq sequence or lowered into a dynamic gammaSTAR document. This separation supports consistent, extensible, and multi-backend workflows without requiring users to maintain independent implementations for each target.
 
-- a concrete Pulseq `.seq` file with numerically resolved events and timing; and
-- a gammaSTAR `.seq.json` document that preserves hierarchy, loop structure, protocol dependencies, and relationship-aware behavior where supported.
+A single sequence definition can produce:
 
-PyPulseq-Star is a bridge to leverage the complementary strengths of Pypulseq and GammaStar:
+- a concrete Pulseq `.seq` file with resolved numerical events and timing; and
+- a gammaSTAR `.seq.json` document that preserves compact hierarchy, editable protocol dependencies, loops, and relationship-aware behavior where supported.
 
 ```text
 PyPulseq-like Python script
         |
         v
-SeqStar hierarchy + protocol + relationships
+Protocol + expressions + hierarchy + relationships
         |
-        +--> Pulseq writer --> concrete .seq
+        +--> immutable numeric realization
+        |       +--> local plotting and validation
+        |       +--> Pulseq writer --> concrete .seq
         |
-        +--> gammaSTAR writer --> hierarchical .seq.json
-        |
-        +--> plotting, timing checks, and relationship inspection
+        +--> gammaSTAR writer --> hierarchical, protocol-aware .seq.json
 ```
 
-> **Project status:** pre-alpha and under active development. APIs may change during the protocol/relationship contract sprint. Generated sequences must be independently reviewed and validated before scanner use.
+> **Release status:** v0.2.0a1 is the first publication-oriented alpha release. It establishes the protocol/expression contract, relationship-aware internal representation, four reference demonstrations, and Pulseq/gammaSTAR export paths intended for software evaluation. PyPulseq-Star remains research software, and generated sequences require independent review and validation before scanner use.
+
+## What is in v0.2.0
+
+The v0.2.0 scope is intentionally bounded. It prioritizes a dependable protocol-oriented workflow across four reference sequences rather than claiming complete sequence-family coverage.
+
+### Release-gated capabilities
+
+- PyPulseq-like RF, gradient, ADC, delay, block, and sequence construction.
+- Protocol parameters represented as editable symbolic references.
+- Explicit sequence hierarchy and compact loop-native motifs.
+- Timing relationships, anchors, symbolic fills, immutable resolution, and timing validation.
+- Pulseq `.seq` export from the resolved numeric realization.
+- gammaSTAR `.seq.json` export with compact hierarchy and live protocol dependencies where supported.
+- Logical read/phase/slice axes with axial, coronal, and sagittal orientation mapping.
+- Single ADC events and multi-window ADC-train abstractions.
+- Four beginner-facing demonstrations: FID, spoiled GRE, EPI, and TSE.
+- Sequence-specific acceptance tests defined in [`docs/release_scope_v0.2.0.md`](docs/release_scope_v0.2.0.md).
+
+### Flexible or relaxed v0.2.0 acceptance areas
+
+The following behaviors must remain structurally correct, while small implementation-dependent differences in exact block counts, raster rounding, or graphical presentation are acceptable when documented:
+
+- phase-encoding loop length;
+- FOV-dependent phase encoding;
+- RF/ADC spoiling progression;
+- TE/TR placement;
+- orientation mapping; and
+- cross-representation agreement.
+
+### Explicitly deferred to v0.3.0
+
+The following tests are not v0.2.0 release gates:
+
+- **EPI-06:** fully interactive echo-spacing/readout-duration retiming across all backends.
+- **TSE-02:** strict ETL-change contract requiring all local, Pulseq, and live gammaSTAR event counts to update under one release-gated test.
+
+The current demos may expose parts of these behaviors, but v0.2.0 does not guarantee them as stable public contracts. See [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Why PyPulseq-Star?
 
-PyPulseq provides a concise and widely understood Python interface for constructing RF, gradient, ADC, delay, block, and sequence objects. Pulseq provides a portable concrete sequence representation.
+PyPulseq made vendor-neutral MR sequence development substantially more accessible by providing a concise Python interface for constructing Pulseq-compatible events and sequences. PyPulseq-Star builds on that foundation for workflows in which a sequence must remain editable at the protocol level, preserve the reasoning that connects parameters to events, and target both concrete and dynamic representations.
 
-gammaSTAR adds a hierarchical and dynamic view of sequence execution. Its representation can preserve loops, protocol-controlled values, dependencies, and scanner-side sequence organization.
+The motivation is not to introduce a separate sequence-programming language. It is to evolve the familiar PyPulseq workflow by retaining information that is normally lost when a script is reduced immediately to numerical events. In PyPulseq-Star, protocol values, symbolic expressions, hierarchy, loop structure, event relationships, and timing intent remain part of the sequence model until an explicit resolution or export step.
 
-PyPulseq-Star explores a developer workflow in which:
+This enables three central properties:
 
-1. sequence construction remains close to PyPulseq;
-2. semantic hierarchy and repetition are declared explicitly;
-3. generic relationships describe why events occur when they do;
-4. the Pulseq writer resolves the sequence to a concrete numerical timeline; and
-5. the gammaSTAR writer preserves the compact hierarchy and dynamic dependencies when possible.
+- **Consistent:** one source definition drives local visualization, validation, concrete Pulseq export, and relationship-aware gammaSTAR export.
+- **Extensible:** the internal representation separates sequence semantics from backend-specific lowering, allowing new sequence families, relationships, validators, and writers to be added without rewriting the overall workflow.
+- **Multi-backend:** the same sequence model can produce a resolved Pulseq `.seq` file and a compact gammaSTAR `.seq.json` document while preserving the capabilities appropriate to each target.
+
+PyPulseq-Star connects these strengths through one development model:
+
+1. sequence construction remains recognizably PyPulseq-like;
+2. protocol-derived values retain their source and dependencies;
+3. hierarchy and repetition are declared explicitly;
+4. timing intent is represented through expressions and relationships;
+5. resolution creates an immutable numerical realization for validation, plotting, and Pulseq export; and
+6. gammaSTAR export preserves compact structure and editable dependencies where the target supports them.
+
+The claim is therefore deliberately bounded: PyPulseq-Star is an evolution of the PyPulseq authoring workflow for relationship-aware, consistent, extensible, and multi-backend sequence development—not a replacement for PyPulseq, Pulseq, or scanner-specific safety validation.
 
 ## Core concepts
 
-### PyPulseq-like event construction
-
-The public constructors follow familiar sequence-building patterns:
+### Protocol-centered construction
 
 ```python
-rf = ppstar.make_block_pulse(...)
-gz = ppstar.make_trapezoid(...)
-adc = ppstar.make_adc(...)
-seq.add_block(rf, gz, role="excitation", node="kernel.excitation")
+protocol = ppstar.Protocol(
+    name="fid",
+    parameters={
+        "sequence_name": "fid",
+        "flip_angle": 90.0,
+        "echo_time": 20e-3,
+        "repetition_time": 1.0,
+        "num_averages": 4,
+    },
+)
+p = protocol.symbols
+
+seq = ppstar.Sequence(system=system, protocol=protocol, name=p.sequence_name)
 ```
+
+Protocol references behave like scalars during sequence construction while preserving their canonical source for resolution and gammaSTAR export.
 
 ### Explicit hierarchy and loops
 
-Logical structure is declared independently of the materialized source timeline:
-
 ```python
 seq.set_node(
-    "shot.kernel.echo_train",
-    role="echo_train",
-    repeat_count="echo_train_length",
-    repeat_every="echo_spacing",
-    counter="echo_index",
+    "kernel",
+    role="kernel",
+    repeat_count=p.num_averages,
+    repeat_every=p.repetition_time,
+    counter="average_index",
     repeat_mode="loop",
 )
 ```
 
-This allows a compact source motif to represent a larger execution hierarchy. The Pulseq writer can lower loops into concrete events, while the gammaSTAR writer can preserve the loop structure.
+A compact source motif can therefore represent a larger execution hierarchy. The Pulseq writer lowers loops to concrete events; the gammaSTAR writer preserves loop structure where supported.
 
 ### Relationship-aware timing
 
-Relationships express timing intent rather than requiring developers to manually calculate every delay:
-
 ```python
-ppstar.relationships.set_readout_after(
-    seq=seq,
-    adc=adc_occurrence,
-    readout_gradient=gx_occurrence,
-    reference=rf_occurrence,
-    offset="echo_time",
-    solve_event=te_fill_occurrence,
-    solve_property="duration",
+te_fixed = seq.duration(
+    start=rf.anchor("center"),
+    end=adc.anchor("start"),
+)
+te_fill = ppstar.make_delay(
+    p.echo_time - te_fixed,
+    system=system,
+    name="te_fill",
 )
 ```
 
-The relationship layer resolves the requested timing for concrete export and retains dependency information for inspection and richer export paths.
+The relationship and expression layers describe timing intent, while `seq.resolve()` evaluates the current protocol and creates an immutable numeric realization.
 
 ### Two export targets
-
-The writers have different responsibilities:
 
 ```text
 Pulseq .seq
     concrete numerical events
-    resolved timing
-    scanner/interpreter-oriented output
+    resolved timing and repetitions
+    interpreter-oriented output
 
 gammaSTAR .seq.json
-    hierarchy and loops
-    protocol-facing values
-    relationship-aware expressions where supported
-    workplace-oriented sequence organization
+    compact hierarchy and loops
+    protocol-facing controls
+    live expressions and dependencies where supported
+    workplace-oriented organization
 ```
 
-## Included beginner examples
+## Included reference demos
 
-The four primary examples use a common structure:
-
-```text
-1. define system limits and protocol parameters
-2. create the sequence and declare logical nodes
-3. create events
-4. construct the executable timeline
-5. define relationships
-6. resolve and check timing
-7. plot
-8. export
-```
-
-| Example | Main idea | Representation |
+| Example | Main idea | v0.2.0 release status |
 |---|---|---|
-| `demo_FID.py` | RF-to-ADC timing with TE and repeated averages | One loop-native kernel |
-| `demo_GRE.py` | Phase encoding, RF spoiling, TE placement, and TR filling | Explicitly expanded phase-encode lines |
-| `demo_EPI.py` | Alternating readout train, phase blips, and multiple ADC windows | Compact synchronized Gx/Gy/ADC train |
-| `demo_TSE.py` | Nested shots and echo trains with loop-indexed phase encoding | Compact nested `shot × echo_train` hierarchy |
+| `demo_FID.py` | RF-to-ADC timing, TE/TR, samples, dwell, and repeated averages | Strict release-gated reference demo |
+| `demo_GRE.py` | Phase encoding, RF/ADC spoiling, TE/TR, and orientation | Included with flexible acceptance constraints |
+| `demo_EPI.py` | Alternating readouts, phase blips, segmentation, ADC windows, and orientation | Release-gated except dynamic echo-spacing/readout retiming |
+| `demo_TSE.py` | Excitation, refocusing train, crushers, readouts, spoilers, and phase-order demonstrations | Smoke export release-gated; strict ETL mutation deferred |
 
-The examples are intended to teach the public workflow, not to serve as clinically validated protocols.
+The demos teach the public API and provide reproducible software examples. They are not clinically validated protocols.
 
 ## Installation
 
-Create a clean environment and install the package:
+### Published alpha release
+
+The publication-facing notebooks and examples for this release should install the exact PyPI artifact:
+
+```bash
+python -m pip install "pypulseq-star==0.2.0a1"
+```
+
+For notebooks, use the IPython `%pip` magic so installation occurs in the active kernel environment:
+
+```python
+%pip install "pypulseq-star==0.2.0a1"
+```
+
+Then verify the imported version:
+
+```python
+import pypulseq_star as ppstar
+
+assert ppstar.__version__ == "0.2.0a1"
+print(ppstar.__version__)
+```
+
+Pinning the alpha release makes the notebook reproducible and prevents it from silently changing when a later package version is published.
+
+### Development installation
 
 ```bash
 python -m venv .venv
@@ -138,21 +199,19 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-Install development tools:
+Development tools:
 
 ```bash
 python -m pip install -e ".[dev]"
 ```
 
-Install dashboard dependencies when working on the relationship viewer:
+Optional plotting and dashboard dependencies:
 
 ```bash
-python -m pip install -e ".[dashboard]"
+python -m pip install -e ".[plotting,dashboard]"
 ```
 
 ## Run the examples
-
-From the repository root:
 
 ```bash
 python examples/demo_FID.py
@@ -161,64 +220,27 @@ python examples/demo_EPI.py
 python examples/demo_TSE.py
 ```
 
-By default, each example may plot and write outputs under its `out/<sequence>/` directory. The `main()` arguments can disable plotting or either writer during development:
+Outputs are written under `out/<sequence>/`. Use each demo's command-line options to disable plotting or adjust supported protocol controls.
 
-```python
-main(plot=False, write_seq=True, write_json=True)
+## Testing
+
+Run the complete test suite:
+
+```bash
+python -m pytest
 ```
 
-Typical outputs are:
+Run with coverage:
 
-```text
-out/fid/fid.seq
-out/fid/fid.seq.json
-out/gre/gre.seq
-out/gre/gre.seq.json
-out/epi/epi.seq
-out/epi/epi.seq.json
-out/tse/tse.seq
-out/tse/tse.seq.json
+```bash
+python -m pytest --cov=pypulseq_star --cov-report=term-missing
 ```
 
-## Minimal example
+The v0.2.0 acceptance scope, strict/flexible/deferred tests, and sequence-level pass criteria are documented in:
 
-```python
-import math
-import pypulseq_star as ppstar
-from pypulseq_star.writers import GammaStarWriter, PulseqWriter
-
-system = ppstar.Opts(max_grad=28, grad_unit="mT/m", max_slew=100, slew_unit="T/m/s")
-protocol = ppstar.Protocol(
-    name="fid",
-    parameters={
-        "Name": "fid",
-        "flip_angle": 90.0,
-        "rf_duration": 300e-6,
-        "TE": 20e-3,
-        "TR": 1.0,
-        "averages": 1,
-        "num_samples": 2048,
-        "dwell": 20e-6,
-    },
-)
-
-seq = ppstar.Sequence(system=system, name="fid", parameters=protocol.parameters)
-rf = ppstar.make_block_pulse(
-    flip_angle=math.radians(90.0),
-    duration=300e-6,
-    system=system,
-    name="rf_excitation",
-)
-adc = ppstar.make_adc(num_samples=2048, dwell=20e-6, system=system, name="fid_adc")
-
-seq.add_block(rf, role="excitation", node="kernel.excitation")
-seq.add_block(adc, role="readout", node="kernel.readout")
-
-PulseqWriter(seq).write("fid.seq")
-GammaStarWriter(seq).write("fid.seq.json")
-```
-
-The full FID demo shows the preferred relationship-aware form.
+- [`docs/release_scope_v0.2.0.md`](docs/release_scope_v0.2.0.md)
+- [`docs/testing_and_acceptance.md`](docs/testing_and_acceptance.md)
+- [`docs/releases/v0.2.0.md`](docs/releases/v0.2.0.md)
 
 ## Development checks
 
@@ -237,51 +259,40 @@ src/pypulseq_star/
   blocks/          block containers
   core/            shared objects and parameter support
   events/          RF, gradient, ADC, and delay events
+  expressions/     protocol references and expression evaluation
   make/            PyPulseq-like constructors
   plotting/        sequence and relationship visualization
   relationships/   timing relationships and validation
   resources/       package data used by exporters/viewers
-  sequence/        sequence and timeline containers
+  sequence/        hierarchy, loops, and executable timeline
   writers/         Pulseq and gammaSTAR export
 examples/           beginner-facing sequence scripts
-tests/              automated tests
+tests/              unit, integration, and release-contract tests
+docs/               architecture, release scope, roadmap, and release notes
 ```
 
-## Relationship-contract work
+## Compatibility and limitations
 
-The next architecture sprint will formalize the contract among:
-
-```text
-Protocol parameters
-        -> relationships and derived values
-        -> compact resolved timeline
-        -> plotter
-        -> Pulseq and gammaSTAR writers
-```
-
-This work will clarify parameter naming, loop-counter bindings, timing-fill ownership, dynamic versus resolved values, and consistency across plotting and export.
+- Python 3.10-3.13.
+- PyPulseq is required for Pulseq `.seq` export.
+- gammaSTAR behavior depends on the target workplace/runtime and supported expression semantics.
+- Public APIs may still change before v1.0, but v0.2.0a1 establishes the first publication-oriented protocol/expression contract.
+- Multi-site and multi-vendor scanner validation is outside the v0.2.0 software-release scope and is planned as a separate experimental study.
 
 ## Contributing
 
-Contributions from PyPulseq users, Pulseq developers, gammaSTAR users, MRI physicists, and research-software developers are welcome. Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
+Contributions from PyPulseq users, Pulseq developers, gammaSTAR users, MRI physicists, and research-software developers are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and the active release scope before proposing changes.
 
-Useful early contributions include:
-
-- testing installation on additional operating systems and Python versions;
-- comparing generated `.seq` files with canonical PyPulseq examples;
-- testing gammaSTAR JSON import and workplace behavior;
-- adding focused timing and relationship tests;
-- reporting scanner/interpreter compatibility results; and
-- improving beginner documentation.
+Release-blocking changes must include a regression test. Generic writers must not contain sequence-family conditionals when metadata or a general contract can express the behavior.
 
 ## Safety and validation
 
-MRI pulse sequences can cause hardware, peripheral nerve stimulation, SAR, timing, and image-quality risks. PyPulseq-Star is research software. A generated file should not be executed on a scanner solely because software timing checks pass. Users are responsible for independent sequence review, vendor/interpreter validation, institutional approvals, and scanner safety procedures.
+MRI pulse sequences can create hardware, peripheral nerve stimulation, SAR, timing, and image-quality risks. PyPulseq-Star is research software. A generated file must not be executed on a scanner solely because software timing checks pass. Users are responsible for independent sequence review, interpreter/vendor validation, institutional approvals, and scanner safety procedures.
 
 ## License
 
-PyPulseq-Star is distributed under the license in [`LICENSE`](LICENSE).
+PyPulseq-Star is distributed under the MIT License. See [`LICENSE`](LICENSE).
 
 ## Citation
 
-A formal software citation will be added with the first archival release and software-paper submission. Until then, cite the repository release and commit used for your work.
+Use [`CITATION.cff`](CITATION.cff) and cite both the exact package release and repository commit used. For the alpha notebooks, the intended software identifier is `pypulseq-star==0.2.0a1`; the preferred article citation will be added after publication of the SoftwareX paper.

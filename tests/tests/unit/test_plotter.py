@@ -39,3 +39,21 @@ def test_loop_plot_expands_representative_kernel(system, monkeypatch) -> None:
 def close_figures():
     yield
     plt.close("all")
+
+
+def test_normalized_rf_uses_one_sequence_wide_scale() -> None:
+    """Relative RF amplitudes must survive normalized plotting."""
+
+    from pypulseq_star.plotting.plotter import _normalize_rendered_rf
+
+    rendered = {
+        "rf": [
+            {"v": [0.0, 0.5, 0.0]},
+            {"v": [0.0, 1.0, 0.0]},
+        ]
+    }
+
+    _normalize_rendered_rf(rendered)
+
+    assert max(rendered["rf"][0]["v"]) == pytest.approx(0.5)
+    assert max(rendered["rf"][1]["v"]) == pytest.approx(1.0)

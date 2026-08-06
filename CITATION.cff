@@ -8,7 +8,7 @@ authors:
   - family-names: Geethanath
     given-names: Sairam
     orcid: "https://orcid.org/0000-0002-3776-4114" # TODO: replace with the correct ORCID or remove
-version: 0.1.0a1
+version: 0.2.0a1
 date-released: "2026-07-13"
 url: "https://github.com/imr-framework/pypulseq-star"
 repository-code: "https://github.com/imr-framework/pypulseq-star"
@@ -30,8 +30,8 @@ preferred-citation:
     - family-names: Geethanath
       given-names: Sairam
       orcid: "https://orcid.org/0000-0002-3776-4114" # TODO: replace with the correct ORCID or remove
-  version: 0.1.0a1
-  date-released: "2026-07-13"
+  version: 0.2.0a1
+  date-released: "2026-08-06"
   url: "https://github.com/imr-framework/pypulseq-star"
   notes: >-
     Preferred citation placeholder before publication of the peer-reviewed

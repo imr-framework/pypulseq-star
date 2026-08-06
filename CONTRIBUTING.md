@@ -2,7 +2,7 @@
 
 Thank you for helping improve PyPulseq-Star. The project is intended to serve PyPulseq/Pulseq developers, gammaSTAR users, MRI physicists, and researchers building reproducible sequence-development workflows.
 
-PyPulseq-Star is currently pre-alpha. Focused issues, reproducible tests, and small pull requests are especially valuable while the protocol/relationship contract is being finalized.
+PyPulseq-Star v0.2.0 is an alpha, publication-oriented release candidate. Focused issues, reproducible tests, and small pull requests are especially valuable while the protocol/expression contract is hardened for v0.3.0.
 
 ## Project principles
 
@@ -15,6 +15,19 @@ Contributions should preserve these boundaries:
 5. **Do not hide sequence logic in opaque templates.** Templates and low-level mappings belong inside writer/resource boundaries, not in developer-facing event construction.
 6. **Add tests for public behavior.** Every constructor, relationship primitive, loop behavior, or writer change should have a focused regression test.
 7. **Treat scanner execution as an experimental result.** Do not claim vendor or scanner compatibility without reporting the interpreter, system, software version, and validation procedure.
+
+
+## Active release scope
+
+Before proposing a release-blocking change, read:
+
+- [`docs/release_scope_v0.2.0.md`](docs/release_scope_v0.2.0.md);
+- [`docs/testing_and_acceptance.md`](docs/testing_and_acceptance.md); and
+- [`docs/roadmap.md`](docs/roadmap.md).
+
+For v0.2.0, FID and the committed EPI tests are strict release gates. GRE uses flexible invariant-based acceptance. EPI-06 and TSE-02 are explicitly deferred to v0.3.0 and should not be represented as completed v0.2.0 contracts.
+
+A contribution may improve deferred behavior, but it must not expand the v0.2.0 public claim unless the release scope is deliberately revised.
 
 ## Ways to contribute
 
@@ -165,7 +178,7 @@ New examples should follow this structure where practical. They should teach the
 
 ## Compatibility and deprecation
 
-During pre-alpha development, APIs may change. Even so, contributors should:
+Before v1.0, APIs may change. Even so, contributors should:
 
 - document intentional breaking changes;
 - update all affected examples and tests in the same pull request;

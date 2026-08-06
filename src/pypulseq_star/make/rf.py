@@ -9,6 +9,16 @@ from typing import Any
 from pypulseq_star.events import SeqStarRFBlockEvent
 from pypulseq_star.opts import Opts
 from pypulseq_star.shapes import SeqStarRFBlockShape
+from pypulseq_star.expressions import EventPropertyRef, Expression
+from ._symbolic import (
+    attach_symbolic_specs,
+    evaluate_default,
+    resolve_float,
+    resolve_optional_float,
+    require_positive,
+    resolve_string,
+    symbolic_specs,
+)
 
 
 def make_block_pulse(
@@ -42,6 +52,28 @@ def make_block_pulse(
         system = Opts.default
 
     parameters = dict(parameters or {})
+
+    constructor_specs = {
+        "flip_angle": flip_angle,
+        "duration": duration,
+        "phase_offset": phase_offset,
+        "freq_offset": freq_offset,
+        "slice_thickness": slice_thickness,
+        "bandwidth": bandwidth,
+        "use": use,
+    }
+
+    symbolic_event_specs = symbolic_specs(
+        flip_angle=flip_angle,
+        duration=duration,
+        phase_offset=phase_offset,
+        freq_offset=freq_offset,
+        slice_thickness=slice_thickness,
+    )
+
+    resolved_slice_thickness = _resolve_slice_thickness_argument(
+        slice_thickness
+    )
 
     resolved_flip_angle = _resolve_flip_angle(
         explicit_flip_angle=flip_angle,
@@ -144,6 +176,13 @@ def make_block_pulse(
         },
     )
 
+    _attach_rf_symbolic_constructor(
+        event,
+        family="block",
+        specs=constructor_specs,
+    )
+    attach_symbolic_specs(event, symbolic_event_specs)
+
     return _return_rf_with_optional_slice_select_gradient(
         event,
         name=name,
@@ -152,7 +191,7 @@ def make_block_pulse(
         duration=raster_duration,
         delay=None,
         pulse_type="block",
-        slice_thickness=slice_thickness,
+        slice_thickness=resolved_slice_thickness,
         bandwidth=bandwidth,
         time_bw_product=None,
         max_grad=max_grad,
@@ -206,13 +245,39 @@ def make_sinc_pulse(
     and RF-gradient relationships are intentionally deferred.
     """
 
-    if slice_thickness is not None and slice_thickness <= 0:
-        raise ValueError(f"slice_thickness must be positive. Passed: {slice_thickness}")
-
     if system is None:
         system = Opts.default
 
     parameters = dict(parameters or {})
+
+    constructor_specs = {
+        "flip_angle": flip_angle,
+        "duration": duration,
+        "phase_offset": phase_offset,
+        "freq_offset": freq_offset,
+        "time_bw_product": time_bw_product,
+        "apodization": apodization,
+        "center_pos": center_pos,
+        "delay": delay,
+        "slice_thickness": slice_thickness,
+        "use": use,
+    }
+
+    symbolic_event_specs = symbolic_specs(
+        flip_angle=flip_angle,
+        duration=duration,
+        phase_offset=phase_offset,
+        freq_offset=freq_offset,
+        time_bw_product=time_bw_product,
+        apodization=apodization,
+        center_pos=center_pos,
+        delay=delay,
+        slice_thickness=slice_thickness,
+    )
+
+    resolved_slice_thickness = _resolve_slice_thickness_argument(
+        slice_thickness
+    )
 
     resolved_flip_angle = _resolve_flip_angle(
         explicit_flip_angle=flip_angle,
@@ -372,6 +437,13 @@ def make_sinc_pulse(
         event.parameters.setdefault("apodization", resolved_apodization)
         event.parameters.setdefault("center_pos", resolved_center_pos)
 
+    _attach_rf_symbolic_constructor(
+        event,
+        family="sinc",
+        specs=constructor_specs,
+    )
+    attach_symbolic_specs(event, symbolic_event_specs)
+
     return _return_rf_with_optional_slice_select_gradient(
         event,
         name=name,
@@ -380,7 +452,7 @@ def make_sinc_pulse(
         duration=raster_duration,
         delay=delay,
         pulse_type="sinc",
-        slice_thickness=slice_thickness,
+        slice_thickness=resolved_slice_thickness,
         bandwidth=None,
         time_bw_product=resolved_time_bw_product,
         max_grad=max_grad,
@@ -421,13 +493,39 @@ def make_gauss_pulse(
     The gammaSTAR ``ssel`` hierarchy node is intentionally deferred.
     """
 
-    if slice_thickness is not None and slice_thickness <= 0:
-        raise ValueError(f"slice_thickness must be positive. Passed: {slice_thickness}")
-
     if system is None:
         system = Opts.default
 
     parameters = dict(parameters or {})
+
+    constructor_specs = {
+        "flip_angle": flip_angle,
+        "duration": duration,
+        "phase_offset": phase_offset,
+        "freq_offset": freq_offset,
+        "time_bw_product": time_bw_product,
+        "apodization": apodization,
+        "center_pos": center_pos,
+        "delay": delay,
+        "slice_thickness": slice_thickness,
+        "use": use,
+    }
+
+    symbolic_event_specs = symbolic_specs(
+        flip_angle=flip_angle,
+        duration=duration,
+        phase_offset=phase_offset,
+        freq_offset=freq_offset,
+        time_bw_product=time_bw_product,
+        apodization=apodization,
+        center_pos=center_pos,
+        delay=delay,
+        slice_thickness=slice_thickness,
+    )
+
+    resolved_slice_thickness = _resolve_slice_thickness_argument(
+        slice_thickness
+    )
 
     resolved_flip_angle = _resolve_flip_angle(
         explicit_flip_angle=flip_angle,
@@ -587,6 +685,13 @@ def make_gauss_pulse(
         event.parameters.setdefault("apodization", resolved_apodization)
         event.parameters.setdefault("center_pos", resolved_center_pos)
 
+    _attach_rf_symbolic_constructor(
+        event,
+        family="gauss",
+        specs=constructor_specs,
+    )
+    attach_symbolic_specs(event, symbolic_event_specs)
+
     return _return_rf_with_optional_slice_select_gradient(
         event,
         name=name,
@@ -595,7 +700,7 @@ def make_gauss_pulse(
         duration=raster_duration,
         delay=delay,
         pulse_type="gauss",
-        slice_thickness=slice_thickness,
+        slice_thickness=resolved_slice_thickness,
         bandwidth=None,
         time_bw_product=resolved_time_bw_product,
         max_grad=max_grad,
@@ -632,13 +737,36 @@ def make_arbitrary_rf(
     available in parameters, otherwise ``1 / duration``.
     """
 
-    if slice_thickness is not None and slice_thickness <= 0:
-        raise ValueError(f"slice_thickness must be positive. Passed: {slice_thickness}")
-
     if system is None:
         system = Opts.default
 
     parameters = dict(parameters or {})
+
+    constructor_specs = {
+        "signal": tuple(signal) if signal is not None else None,
+        "flip_angle": flip_angle,
+        "duration": duration,
+        "dwell": dwell,
+        "phase_offset": phase_offset,
+        "freq_offset": freq_offset,
+        "delay": delay,
+        "slice_thickness": slice_thickness,
+        "use": use,
+    }
+
+    symbolic_event_specs = symbolic_specs(
+        flip_angle=flip_angle,
+        duration=duration,
+        dwell=dwell,
+        phase_offset=phase_offset,
+        freq_offset=freq_offset,
+        delay=delay,
+        slice_thickness=slice_thickness,
+    )
+
+    resolved_slice_thickness = _resolve_slice_thickness_argument(
+        slice_thickness
+    )
 
     resolved_signal = _resolve_arbitrary_signal(
         explicit_signal=signal,
@@ -773,6 +901,13 @@ def make_arbitrary_rf(
         event.parameters.setdefault("arbitrary_input_dwell", dwell)
         event.parameters.setdefault("arbitrary_raster_dwell", system.rf_raster_time)
 
+    _attach_rf_symbolic_constructor(
+        event,
+        family="arbitrary",
+        specs=constructor_specs,
+    )
+    attach_symbolic_specs(event, symbolic_event_specs)
+
     return _return_rf_with_optional_slice_select_gradient(
         event,
         name=name,
@@ -781,7 +916,7 @@ def make_arbitrary_rf(
         duration=raster_duration,
         delay=delay,
         pulse_type="arbitrary",
-        slice_thickness=slice_thickness,
+        slice_thickness=resolved_slice_thickness,
         bandwidth=None,
         time_bw_product=_resolve_optional_float_parameter(
             parameters=parameters,
@@ -792,6 +927,153 @@ def make_arbitrary_rf(
         return_gz=return_gz,
         channel=channel,
     )
+
+
+def _attach_rf_symbolic_constructor(
+    event: Any,
+    *,
+    family: str,
+    specs: Mapping[str, Any],
+) -> None:
+    """Retain RF constructor intent for sequence resolution and gammaSTAR."""
+
+    record = {
+        "family": str(family),
+        "specs": dict(specs),
+    }
+
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, dict):
+        metadata["symbolic_constructor"] = record
+
+    parameters = getattr(event, "parameters", None)
+    if isinstance(parameters, dict):
+        parameters["_symbolic_constructor"] = record
+
+
+def _rf_constructor_specs(event: Any) -> dict[str, Any]:
+    """Return the original RF constructor inputs retained on an event."""
+
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, Mapping):
+        record = metadata.get("symbolic_constructor")
+        if isinstance(record, Mapping):
+            specs = record.get("specs")
+            if isinstance(specs, Mapping):
+                return dict(specs)
+
+    parameters = getattr(event, "parameters", None)
+    if isinstance(parameters, Mapping):
+        record = parameters.get("_symbolic_constructor")
+        if isinstance(record, Mapping):
+            specs = record.get("specs")
+            if isinstance(specs, Mapping):
+                return dict(specs)
+
+    return {}
+
+
+def _set_gradient_symbolic_constructor_specs(
+    gradient: Any,
+    **updates: Any,
+) -> None:
+    """Update a numeric gradient with authoritative symbolic constructor inputs.
+
+    The gradient is first constructed numerically so plotting, Pulseq writing,
+    and immediate validation remain available. This helper then replaces only
+    the authoritative constructor fields with their original expressions for
+    sequence resolution and gammaSTAR export.
+    """
+
+    symbolic_updates = {
+        key: value
+        for key, value in updates.items()
+        if isinstance(value, Expression)
+    }
+    if not symbolic_updates:
+        return
+
+    for store_name, constructor_key in (
+        ("metadata", "symbolic_constructor"),
+        ("parameters", "_symbolic_constructor"),
+    ):
+        store = getattr(gradient, store_name, None)
+        if not isinstance(store, dict):
+            continue
+
+        record = store.get(constructor_key)
+        if not isinstance(record, dict):
+            record = {
+                "family": "trapezoid",
+                "specs": {},
+            }
+            store[constructor_key] = record
+
+        specs = record.setdefault("specs", {})
+        if isinstance(specs, dict):
+            specs.update(symbolic_updates)
+
+    metadata = getattr(gradient, "metadata", None)
+    if isinstance(metadata, dict):
+        metadata.setdefault("symbolic_properties", {}).update(
+            symbolic_updates
+        )
+        metadata["has_symbolic_properties"] = True
+
+    parameters = getattr(gradient, "parameters", None)
+    if isinstance(parameters, dict):
+        parameters.setdefault("_symbolic_properties", {}).update(
+            symbolic_updates
+        )
+
+
+def _slice_select_symbolic_inputs(
+    event: Any,
+    *,
+    numeric_duration: float,
+    numeric_slice_thickness: float,
+    numeric_bandwidth: float,
+) -> tuple[Any, Any, Any]:
+    """Return authoritative duration, thickness, and bandwidth specifications."""
+
+    specs = _rf_constructor_specs(event)
+
+    duration_spec = specs.get("duration")
+    if duration_spec is None:
+        duration_spec = numeric_duration
+
+    thickness_spec = specs.get("slice_thickness")
+    if thickness_spec is None:
+        thickness_spec = numeric_slice_thickness
+
+    bandwidth_spec = specs.get("bandwidth")
+    if bandwidth_spec is None:
+        tbw_spec = specs.get("time_bw_product")
+        if tbw_spec is not None:
+            bandwidth_spec = tbw_spec / duration_spec
+        elif isinstance(duration_spec, Expression):
+            bandwidth_spec = 1.0 / duration_spec
+        else:
+            bandwidth_spec = numeric_bandwidth
+
+    return duration_spec, thickness_spec, bandwidth_spec
+
+
+def _resolve_slice_thickness_argument(
+    value: Any | None,
+) -> float | None:
+    """Resolve and validate slice thickness before numeric use."""
+
+    resolved = resolve_optional_float(
+        value,
+        field_name="slice_thickness",
+    )
+    require_positive(
+        resolved,
+        field_name="slice_thickness",
+        allow_none=True,
+    )
+    return resolved
 
 
 def _return_rf_with_optional_slice_select_gradient(
@@ -838,12 +1120,10 @@ def _return_rf_with_optional_slice_select_gradient(
             raise ValueError("slice_thickness must be supplied when return_gz=True.")
         return event
 
-    resolved_slice_thickness = float(slice_thickness)
-
-    if resolved_slice_thickness <= 0:
-        raise ValueError(
-            f"slice_thickness must be positive. Passed: {resolved_slice_thickness}"
-        )
+    resolved_slice_thickness = _resolve_slice_thickness_argument(
+        slice_thickness
+    )
+    assert resolved_slice_thickness is not None
 
     gradient_bandwidth = _resolve_slice_select_bandwidth(
         bandwidth=bandwidth,
@@ -853,6 +1133,20 @@ def _return_rf_with_optional_slice_select_gradient(
     )
 
     gradient_amplitude = gradient_bandwidth / resolved_slice_thickness
+
+    (
+        symbolic_rf_duration,
+        symbolic_slice_thickness,
+        symbolic_gradient_bandwidth,
+    ) = _slice_select_symbolic_inputs(
+        event,
+        numeric_duration=float(duration),
+        numeric_slice_thickness=resolved_slice_thickness,
+        numeric_bandwidth=gradient_bandwidth,
+    )
+    symbolic_gradient_amplitude = (
+        symbolic_gradient_bandwidth / symbolic_slice_thickness
+    )
 
     rf_delay = max(
         float(
@@ -897,8 +1191,14 @@ def _return_rf_with_optional_slice_select_gradient(
         max_slew=max_slew,
         name=slice_select_name,
         role="slice_select",
-        axis_role="slice_select",
+        axis_role="slice",
         metadata=gz_metadata,
+    )
+
+    _set_gradient_symbolic_constructor_specs(
+        gz,
+        amplitude=symbolic_gradient_amplitude,
+        flat_time=symbolic_rf_duration,
     )
 
     gz_actual_name = getattr(gz, "name", slice_select_name)
@@ -939,8 +1239,18 @@ def _return_rf_with_optional_slice_select_gradient(
         max_slew=max_slew,
         name=slice_refocus_name,
         role="slice_refocus",
-        axis_role="slice_refocus",
+        axis_role="slice",
         metadata=gzr_metadata,
+    )
+
+    symbolic_refocus_area = -0.5 * EventPropertyRef(
+        gz_actual_name,
+        "area",
+        metadata={"event": gz},
+    )
+    _set_gradient_symbolic_constructor_specs(
+        gzr,
+        area=symbolic_refocus_area,
     )
 
     gzr_actual_name = getattr(gzr, "name", slice_refocus_name)
@@ -1112,7 +1422,10 @@ def _resolve_slice_select_bandwidth(
     """Resolve RF slice-select bandwidth in Hz."""
 
     if bandwidth is not None:
-        resolved = float(bandwidth)
+        resolved = resolve_float(
+            bandwidth,
+            field_name="slice-select bandwidth",
+        )
     else:
         protocol_bandwidth = _first_present(
             parameters,
@@ -1211,9 +1524,13 @@ def _resolve_flip_angle(
     """Resolve RF flip angle."""
 
     if explicit_flip_angle is not None:
-        if explicit_flip_angle <= 0:
-            raise ValueError(f"flip_angle must be positive. Passed: {explicit_flip_angle}")
-        return float(explicit_flip_angle)
+        resolved = resolve_float(
+            explicit_flip_angle,
+            field_name="flip_angle",
+        )
+        if resolved <= 0:
+            raise ValueError(f"flip_angle must be positive. Passed: {resolved}")
+        return resolved
 
     protocol_value = _first_present(
         parameters,
@@ -1231,7 +1548,7 @@ def _resolve_flip_angle(
             "parameters such as 'flip_angle_excitation' or 'FA'."
         )
 
-    flip_angle_deg = float(protocol_value)
+    flip_angle_deg = resolve_float(protocol_value, field_name="flip_angle")
 
     if flip_angle_deg <= 0:
         raise ValueError(f"Protocol flip angle must be positive. Passed: {flip_angle_deg}")
@@ -1247,9 +1564,13 @@ def _resolve_duration(
     """Resolve RF pulse duration in seconds."""
 
     if explicit_duration is not None:
-        if explicit_duration <= 0:
-            raise ValueError(f"duration must be positive. Passed: {explicit_duration}")
-        return float(explicit_duration)
+        resolved = resolve_float(
+            explicit_duration,
+            field_name="RF duration",
+        )
+        if resolved <= 0:
+            raise ValueError(f"duration must be positive. Passed: {resolved}")
+        return resolved
 
     protocol_value = _first_present(
         parameters,
@@ -1272,7 +1593,7 @@ def _resolve_duration(
             "parameters such as 'rf_duration' or 'excitation_duration'."
         )
 
-    resolved_duration = float(protocol_value)
+    resolved_duration = resolve_float(protocol_value, field_name="RF duration")
 
     if resolved_duration <= 0:
         raise ValueError(f"Protocol RF duration must be positive. Passed: {resolved_duration}")
@@ -1291,9 +1612,13 @@ def _resolve_arbitrary_duration(
     """Resolve arbitrary RF duration in seconds."""
 
     if explicit_duration is not None:
-        if explicit_duration <= 0:
-            raise ValueError(f"duration must be positive. Passed: {explicit_duration}")
-        return float(explicit_duration)
+        resolved = resolve_float(
+            explicit_duration,
+            field_name="RF duration",
+        )
+        if resolved <= 0:
+            raise ValueError(f"duration must be positive. Passed: {resolved}")
+        return resolved
 
     protocol_duration = _first_present(
         parameters,
@@ -1306,7 +1631,10 @@ def _resolve_arbitrary_duration(
     )
 
     if protocol_duration is not None:
-        resolved_duration = float(protocol_duration)
+        resolved_duration = resolve_float(
+            protocol_duration,
+            field_name="arbitrary RF duration",
+        )
         if resolved_duration <= 0:
             raise ValueError(
                 f"Protocol arbitrary RF duration must be positive. Passed: {resolved_duration}"
@@ -1314,9 +1642,15 @@ def _resolve_arbitrary_duration(
         return resolved_duration
 
     if dwell is not None:
-        if dwell <= 0:
-            raise ValueError(f"dwell must be positive. Passed: {dwell}")
-        return signal_length * float(dwell)
+        resolved_dwell = resolve_float(
+            dwell,
+            field_name="arbitrary RF dwell",
+        )
+        if resolved_dwell <= 0:
+            raise ValueError(
+                f"dwell must be positive. Passed: {resolved_dwell}"
+            )
+        return signal_length * resolved_dwell
 
     protocol_dwell = _first_present(
         parameters,
@@ -1328,7 +1662,10 @@ def _resolve_arbitrary_duration(
     )
 
     if protocol_dwell is not None:
-        resolved_dwell = float(protocol_dwell)
+        resolved_dwell = resolve_float(
+            protocol_dwell,
+            field_name="arbitrary RF dwell",
+        )
         if resolved_dwell <= 0:
             raise ValueError(f"Protocol dwell must be positive. Passed: {resolved_dwell}")
         return signal_length * resolved_dwell
@@ -1346,14 +1683,14 @@ def _resolve_float_parameter(
     """Resolve a float from explicit value first, protocol second, default third."""
 
     if explicit_value is not None:
-        return float(explicit_value)
+        return resolve_float(explicit_value, field_name=keys[0])
 
     protocol_value = _first_present(parameters, keys)
 
     if protocol_value is None:
         return default
 
-    return float(protocol_value)
+    return resolve_float(protocol_value, field_name=keys[0])
 
 
 def _resolve_string_parameter(
@@ -1366,14 +1703,14 @@ def _resolve_string_parameter(
     """Resolve a string from explicit value first, protocol second, default third."""
 
     if explicit_value is not None:
-        return explicit_value
+        return resolve_string(explicit_value, field_name=keys[0])
 
     protocol_value = _first_present(parameters, keys)
 
     if protocol_value is None:
         return default
 
-    return str(protocol_value)
+    return resolve_string(protocol_value, field_name=keys[0])
 
 
 def _resolve_arbitrary_signal(

@@ -217,6 +217,13 @@ class SeqStarPlotter:
             rendered,
         )
 
+        # Normalize RF amplitudes once across the complete rendered sequence.
+        # Per-event normalization makes every pulse peak at 1.0 and therefore
+        # hides relative flip-angle scaling (for example, 90-degree excitation
+        # versus 180-degree refocusing pulses in TSE).
+        if rf_scale == "normalized":
+            _normalize_rendered_rf(rendered)
+
         inferred_duration = _render_duration(rendered)
 
         if time_range is None:
@@ -352,8 +359,9 @@ class SeqStarPlotter:
         v_values = v_values[:count]
 
         if rf_scale == "normalized":
-            max_abs = max(abs(v) for v in v_values) or 1.0
-            v_values = [v / max_abs for v in v_values]
+            # Preserve physical relative amplitudes here. The complete RF
+            # channel is normalized after all events and logical repetitions
+            # have been rendered.
             y_label = "RF"
         elif rf_scale == "tesla":
             y_label = "RF (T)"
@@ -462,7 +470,7 @@ class SeqStarPlotter:
     ) -> dict[str, Any] | None:
         """Render a gradient event."""
 
-        axis = _gradient_axis(event)
+        axis = _gradient_axis(event, sequence=self.seq)
 
         if axis not in {"x", "y", "z"}:
             return None
@@ -2119,8 +2127,39 @@ def _is_gradient_event(event: Any) -> bool:
         )
     )
 
-def _gradient_axis(event: Any) -> str | None:
-    """Return gradient axis x/y/z."""
+def _gradient_axis(
+    event: Any,
+    *,
+    sequence: Any | None = None,
+) -> str | None:
+    """Return the physical gradient axis x/y/z.
+
+    Logical ``axis_role`` metadata is mapped through the sequence encoding
+    frame when available. Falling back to the event channel preserves legacy
+    behavior for sequences that do not use logical imaging axes.
+    """
+
+    logical_role = None
+    for attr in ("logical_axis", "axis_role", "encoding_role"):
+        value = str(getattr(event, attr, "") or "").strip().lower()
+        if value in {"read", "phase", "slice"}:
+            logical_role = value
+            break
+    metadata = getattr(event, "metadata", None)
+    if logical_role is None and isinstance(metadata, Mapping):
+        for key in ("logical_axis", "axis_role", "encoding_role"):
+            value = str(metadata.get(key) or "").strip().lower()
+            if value in {"read", "phase", "slice"}:
+                logical_role = value
+                break
+
+    frame = getattr(sequence, "encoding_frame", None)
+    if logical_role is not None and frame is not None:
+        direction = getattr(frame, f"{logical_role}_dir", None)
+        if isinstance(direction, (list, tuple)) and len(direction) >= 3:
+            magnitudes = [abs(float(direction[i])) for i in range(3)]
+            if max(magnitudes) > 0:
+                return ("x", "y", "z")[magnitudes.index(max(magnitudes))]
 
     for attr in ("axis", "channel"):
         if hasattr(event, attr) and getattr(event, attr) is not None:
@@ -2701,6 +2740,27 @@ def _first_event_unit(events: list[dict[str, Any]]) -> str | None:
             return str(unit)
 
     return None
+
+
+def _normalize_rendered_rf(rendered: dict[str, Any]) -> None:
+    """Normalize the RF channel with one scale factor for the full sequence.
+
+    A single channel-wide scale preserves relative RF amplitudes. In
+    particular, otherwise-identical 90-degree and 180-degree pulses render at
+    approximately 0.5 and 1.0 rather than both being independently normalized
+    to 1.0.
+    """
+
+    rf_events = rendered.get("rf", [])
+    max_abs = max(
+        (abs(float(value)) for event in rf_events for value in event.get("v", [])),
+        default=0.0,
+    )
+    if max_abs <= 0.0:
+        return
+
+    for event in rf_events:
+        event["v"] = [float(value) / max_abs for value in event.get("v", [])]
 
 
 def _render_duration(render: dict[str, Any]) -> float:

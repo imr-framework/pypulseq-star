@@ -45,6 +45,7 @@ import numpy as np
 import pypulseq as pp
 
 from pypulseq_star.calc_duration import calc_duration
+from pypulseq_star.writers._realization import sequence_view
 
 
 class PulseqWriter:
@@ -103,7 +104,34 @@ class PulseqWriter:
         self.auto_resolve_relationships = auto_resolve_relationships
         self.profile = bool(profile)
 
-    def write(self, path: str | Path) -> Path:
+    def write(
+        self,
+        path: str | Path,
+        *,
+        realization: Any | None = None,
+    ) -> Path:
+        """Write a Pulseq file, optionally from a numeric realization."""
+
+        view = sequence_view(
+            self.sequence,
+            realization=realization,
+        )
+
+        if not view.is_resolved:
+            return self._write_current_sequence(path)
+
+        resolved_writer = type(self)(
+            view.export_sequence,
+            adc_train_policy=self.adc_train_policy,
+            allow_multiwindow_adc_with_other_events=(
+                self.allow_multiwindow_adc_with_other_events
+            ),
+            auto_resolve_relationships=False,
+            profile=self.profile,
+        )
+        return resolved_writer._write_current_sequence(path)
+
+    def _write_current_sequence(self, path: str | Path) -> Path:
         """Write the enriched SeqStar sequence as a `.seq` file.
 
         Relationship policy
@@ -662,10 +690,9 @@ def _events_to_pulseq_event_groups(
             ordinary_events.append(event)
 
     if not adc_train_events:
-        pulseq_events = [
-            _to_pypulseq_event(event, system)
-            for event in ordinary_events
-        ]
+        pulseq_events = _ordinary_events_to_pulseq_with_rotation(
+            ordinary_events, system
+        )
         return [[event for event in pulseq_events if event is not None]]
 
     total_adc_windows = sum(
@@ -716,10 +743,9 @@ def _events_to_pulseq_event_groups(
     if total_adc_windows == len(adc_train_events):
         pulseq_events: list[Any] = []
 
-        for event in ordinary_events:
-            converted = _to_pypulseq_event(event, system)
-            if converted is not None:
-                pulseq_events.append(converted)
+        pulseq_events.extend(
+            _ordinary_events_to_pulseq_with_rotation(ordinary_events, system)
+        )
 
         for adc_event in adc_train_events:
             converted = _adc_to_pypulseq(adc_event, system)
@@ -731,11 +757,9 @@ def _events_to_pulseq_event_groups(
     pulseq_event_groups: list[list[Any]] = []
 
     if ordinary_events:
-        ordinary_group = [
-            _to_pypulseq_event(event, system)
-            for event in ordinary_events
-        ]
-        ordinary_group = [event for event in ordinary_group if event is not None]
+        ordinary_group = _ordinary_events_to_pulseq_with_rotation(
+            ordinary_events, system
+        )
 
         if ordinary_group:
             pulseq_event_groups.append(ordinary_group)
@@ -1220,6 +1244,84 @@ def _sequential_adc_lowering_will_violate_timing(
         exported_time += padded_group_duration
 
     return False
+
+
+def _ordinary_events_to_pulseq_with_rotation(
+    events: list[Any],
+    system: pp.Opts,
+) -> list[Any]:
+    """Lower ordinary events, rotating logical gradients into physical axes.
+
+    Axis-aligned frames retain trapezoids. Oblique frames are sampled on the
+    gradient raster, summed per physical channel, and emitted as arbitrary
+    gradients. This ensures simultaneous read/phase/slice gradients are
+    combined before physical-axis hardware checks.
+    """
+    gradients=[event for event in events if _is_gradient_event(event)]
+    nongradients=[event for event in events if not _is_gradient_event(event)]
+    result=[_to_pypulseq_event(event,system) for event in nongradients]
+    result=[event for event in result if event is not None]
+    if not gradients: return result
+
+    directions=[_gradient_physical_direction(event) for event in gradients]
+    axis_aligned=all(
+        sum(abs(v)>1e-9 for v in direction)==1
+        and any(abs(abs(v)-1.0)<1e-9 for v in direction)
+        for direction in directions
+    )
+    physical_axes=[]
+    for direction in directions:
+        physical_axes.append(max(range(3), key=lambda i: abs(direction[i])))
+    no_collision=len(set(physical_axes))==len(physical_axes)
+
+    if axis_aligned and no_collision:
+        for event,direction,axis_index in zip(gradients,directions,physical_axes,strict=True):
+            coefficient=direction[axis_index]
+            result.append(_gradient_to_pypulseq(
+                event, system,
+                channel=("x","y","z")[axis_index],
+                scale=coefficient,
+            ))
+        return result
+
+    raster=float(getattr(system,"grad_raster_time",10e-6))
+    block_duration=max(_get_event_delay(event)+_get_event_active_duration(event) for event in gradients)
+    count=max(1,int(math.ceil(block_duration/raster-1e-12)))
+    sample_times=(np.arange(count,dtype=float)+0.5)*raster
+    physical=np.zeros((3,count),dtype=float)
+    for event,direction in zip(gradients,directions,strict=True):
+        delay=_get_event_delay(event)
+        tt=np.asarray(getattr(event,"tt"),dtype=float)+delay
+        waveform=np.asarray(getattr(event,"waveform"),dtype=float)
+        if tt.size != waveform.size:
+            raise ValueError("Gradient time and waveform arrays must have equal length for rotation.")
+        logical=np.interp(sample_times,tt,waveform,left=0.0,right=0.0)
+        for axis in range(3): physical[axis]+=direction[axis]*logical
+
+    max_grad=float(getattr(system,"max_grad",float("inf")))
+    max_slew=float(getattr(system,"max_slew",float("inf")))
+    for axis,channel in enumerate(("x","y","z")):
+        waveform=physical[axis]
+        if not np.any(np.abs(waveform)>1e-12): continue
+        if np.max(np.abs(waveform))>max_grad*(1+1e-12):
+            raise ValueError(f"Rotated {channel}-gradient exceeds max_grad.")
+        if waveform.size>1 and np.max(np.abs(np.diff(waveform))/raster)>max_slew*(1+1e-12):
+            raise ValueError(f"Rotated {channel}-gradient exceeds max_slew.")
+        result.append(pp.make_arbitrary_grad(channel=channel,waveform=waveform,system=system))
+    return result
+
+
+def _gradient_physical_direction(event: Any) -> tuple[float,float,float]:
+    value=getattr(event,"physical_direction",None)
+    if isinstance(value,(list,tuple)) and len(value)==3:
+        return tuple(float(v) for v in value)
+    metadata=getattr(event,"metadata",None)
+    if isinstance(metadata,Mapping):
+        value=metadata.get("physical_direction")
+        if isinstance(value,(list,tuple)) and len(value)==3:
+            return tuple(float(v) for v in value)
+    channel=_gradient_channel(event) or "x"
+    return {"x":(1.0,0.0,0.0),"y":(0.0,1.0,0.0),"z":(0.0,0.0,1.0)}[channel]
 
 
 def _to_pypulseq_event(event: Any, system: pp.Opts) -> Any | None:
@@ -1827,7 +1929,13 @@ def _merge_adc_windows_for_continuous_export(
 
 
 
-def _gradient_to_pypulseq(event: Any, system: pp.Opts) -> Any:
+def _gradient_to_pypulseq(
+    event: Any,
+    system: pp.Opts,
+    *,
+    channel: str | None = None,
+    scale: float = 1.0,
+) -> Any:
     """Convert a SeqStar gradient event/shape to a PyPulseq gradient.
 
     This function is intentionally writer-side and conservative. The SeqStar
@@ -1854,18 +1962,24 @@ def _gradient_to_pypulseq(event: Any, system: pp.Opts) -> Any:
             "add the returned ramp_up, flat_top, and ramp_down events separately."
         )
 
-    channel = _gradient_channel(event)
+    channel = channel or _gradient_channel(event)
 
     if channel is None:
         raise ValueError(f"Gradient event {event!r} is missing channel/axis.")
 
     if _is_arbitrary_gradient_event(event):
-        return _arbitrary_gradient_to_pypulseq(event, system, channel=channel)
+        return _arbitrary_gradient_to_pypulseq(
+            event, system, channel=channel, scale=scale
+        )
 
-    return _trapezoid_gradient_to_pypulseq(event, system, channel=channel)
+    return _trapezoid_gradient_to_pypulseq(
+        event, system, channel=channel, scale=scale
+    )
 
 
-def _trapezoid_gradient_to_pypulseq(event: Any, system: pp.Opts, *, channel: str) -> Any:
+def _trapezoid_gradient_to_pypulseq(
+    event: Any, system: pp.Opts, *, channel: str, scale: float = 1.0
+) -> Any:
     """Lower a SeqStar trapezoid-like gradient to ``pp.make_trapezoid``."""
 
     delay = _gradient_float(
@@ -1883,6 +1997,9 @@ def _trapezoid_gradient_to_pypulseq(event: Any, system: pp.Opts, *, channel: str
     amplitude = _gradient_value(event, keys=("amplitude", "amp"), default=None)
     flat_area = _gradient_value(event, keys=("flat_area",), default=None)
     area = _gradient_value(event, keys=("area",), default=None)
+    if amplitude is not None: amplitude = float(amplitude) * scale
+    if flat_area is not None: flat_area = float(flat_area) * scale
+    if area is not None: area = float(area) * scale
 
     rise_time = _gradient_value(event, keys=("rise_time", "rut"), default=None)
     flat_time = _gradient_value(event, keys=("flat_time", "ft"), default=None)
@@ -1956,7 +2073,9 @@ def _trapezoid_gradient_to_pypulseq(event: Any, system: pp.Opts, *, channel: str
     return _call_make_trapezoid_with_supported_kwargs(kwargs)
 
 
-def _arbitrary_gradient_to_pypulseq(event: Any, system: pp.Opts, *, channel: str) -> Any:
+def _arbitrary_gradient_to_pypulseq(
+    event: Any, system: pp.Opts, *, channel: str, scale: float = 1.0
+) -> Any:
     """Lower a SeqStar arbitrary-gradient-like event to ``pp.make_arbitrary_grad``."""
 
     waveform = _gradient_waveform_for_pulseq(event)

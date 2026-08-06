@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from time import perf_counter
 from collections.abc import Iterable, Mapping
@@ -52,7 +53,7 @@ from typing import Any
 
 from pypulseq_star.calc_duration import calc_duration
 
-# gammaSTAR generic document writer patch level: v15-unified-adc-parent-delay
+# gammaSTAR generic document writer patch level: v37-adc-header-offcenter-alias
 
 
 RF_RECT_BLUEPRINT = "184dfa36-f86e-425f-a653-40d47a4a99b2"
@@ -76,6 +77,38 @@ ARBITRARY_GRADIENT_BLUEPRINT = "57cf5ac4-75ff-4ec7-8c3c-65fcda338f6f"
 GRAD_PULSE_BLUEPRINT = "GradPulse"
 
 
+def _gammastar_debug_enabled() -> bool:
+    return str(os.environ.get("PYPULSEQ_STAR_GAMMASTAR_DEBUG", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "debug",
+    }
+
+
+def _gammastar_debug(message: str) -> None:
+    if _gammastar_debug_enabled():
+        print(f"[gammastar.writer] {message}")
+
+
+def _debug_value_summary(value: Any) -> str:
+    try:
+        canonical = value.to_canonical() if hasattr(value, "to_canonical") else None
+    except Exception as exc:
+        canonical = f"<canonical failed: {type(exc).__name__}>"
+    try:
+        deps = sorted(getattr(value, "dependencies", []) or [])
+    except Exception:
+        deps = []
+    return (
+        f"type={type(value).__name__} "
+        f"contains_expr={_contains_protocol_expression(value)} "
+        f"canonical={canonical!r} deps={deps!r} value={value!r}"
+    )
+
+
+
 class GenericGammaStarDocumentBuilder:
     """Build a gammaSTAR JSON document from a SeqStar sequence."""
 
@@ -83,10 +116,16 @@ class GenericGammaStarDocumentBuilder:
         self,
         sequence: Any,
         *,
+        symbolic_sequence: Any | None = None,
+        realization: Any | None = None,
         auto_resolve_relationships: bool = True,
         profile: bool = False,
     ) -> None:
         self.sequence = sequence
+        # Preserve caller-supplied symbolic sequence even if the sequence
+        # object is falsy through a node/children/container model.
+        self.symbolic_sequence = sequence if symbolic_sequence is None else symbolic_sequence
+        self.realization = realization
         self.system = sequence.system
         self.auto_resolve_relationships = auto_resolve_relationships
         self.profile = bool(profile)
@@ -97,6 +136,7 @@ class GenericGammaStarDocumentBuilder:
         self._block_export_records: list[dict[str, Any]] = []
         self._live_protocol_values: dict[str, Any] = {}
         self._active_loop_path = "root.average"
+        self._variation_export_records: list[dict[str, Any]] = []
 
     def to_dict(self) -> dict[str, Any]:
         """Return a gammaSTAR JSON document.
@@ -133,8 +173,23 @@ class GenericGammaStarDocumentBuilder:
             raise ValueError("Cannot export an empty SeqStar sequence to gammaSTAR JSON.")
 
         self._live_protocol_values = _canonical_protocol_values(
-            _collect_protocol_values(self.sequence)
+            _merge_protocol_values_for_export(
+                export_sequence=self.sequence,
+                symbolic_sequence=self.symbolic_sequence,
+            )
         )
+        if _gammastar_debug_enabled():
+            _gammastar_debug(
+                "builder sequence ids: "
+                f"export={id(self.sequence)} symbolic={id(self.symbolic_sequence)} "
+                f"same={self.sequence is self.symbolic_sequence}"
+            )
+            for _key in ("phase_encode_start", "phase_encode_step", "n_y", "fov"):
+                if _key in self._live_protocol_values:
+                    _gammastar_debug(
+                        f"live_protocol_values[{_key!r}] "
+                        + _debug_value_summary(self._live_protocol_values[_key])
+                    )
         compact_export = bool(
             self._live_protocol_values.get("compact_gamma_export", False)
             or self._live_protocol_values.get("seqstar_compact_export", False)
@@ -143,6 +198,7 @@ class GenericGammaStarDocumentBuilder:
         export_mode = "single_block"
         motif_info: dict[str, Any] | None = None
         export_blocks: list[Any] = []
+        explicit_repeat_info: dict[str, Any] | None = None
 
         if len(blocks) == 1:
             block = blocks[0]
@@ -329,8 +385,13 @@ class GenericGammaStarDocumentBuilder:
             "explicit_node_repeat",
             "explicit_materialized_repeat",
         }:
+            # The gammaSTAR loop path describes the repeated logical node, not
+            # the protocol parameter that controls its length.  For example,
+            # node="segment" with repeat_count="seqstar_segments" must export
+            # root.segment, while root.segment.length remains driven by the
+            # seqstar_segments protocol relationship.
             loop_token = str(
-                explicit_repeat_info.get("loop_token", "seqstar_loop")
+                explicit_repeat_info.get("node_loop_token", "seqstar_loop")
             )
             loop_path = f"root.{_safe_path_token(loop_token)}"
         else:
@@ -355,11 +416,18 @@ class GenericGammaStarDocumentBuilder:
             kernel_path: KERNEL_BLUEPRINT,
         }
 
+        repeat_count_ref = None
+        if explicit_repeat_info is not None:
+            repeat_count_ref = explicit_repeat_info.get("record", {}).get(
+                "repeat_count"
+            )
+
         self._add_root_loop_and_kernel(
             params=params,
             loop_path=loop_path,
             kernel_path=kernel_path,
             repetitions=repetitions,
+            repeat_count_ref=repeat_count_ref,
             tr=tr,
             block_duration=block_duration,
         )
@@ -377,7 +445,11 @@ class GenericGammaStarDocumentBuilder:
             params["root.info.seqstar_motif_length_blocks"] = _literal(
                 int(motif_info["motif_length"])
             )
-            params["root.info.seqstar_motif_repetitions"] = _literal(
+            params["root.info.seqstar_motif_repetitions"] = _expr(
+                inputs={"count": f"{loop_path}.length"},
+                script="return count",
+            )
+            params["root.info.seqstar_default_motif_repetitions"] = _literal(
                 int(motif_info["repetitions"])
             )
             if not compact_export:
@@ -446,6 +518,26 @@ class GenericGammaStarDocumentBuilder:
             exported_events=events,
         )
 
+        # Apply declarative loop-dependent event variations such as
+        # kernel.vary(vary(gy_pre, "area", ...)). This is intentionally generic:
+        # the variation metadata is attached by Sequence/NodeHandle and the
+        # writer only scales the exported event property by the active loop
+        # counter. It handles the common single-loop GRE phase-encode case.
+        self._apply_single_loop_variations_and_bindings(
+            params=params,
+            loop_path=loop_path,
+        )
+
+        # Preserve protocol dependencies embedded directly in trapezoid
+        # constructor inputs, e.g. spoiler area = 2*n_x/fov.  These gradients
+        # are not loop variations, so without this pass gammaSTAR receives only
+        # the resolved default waveform and interactive protocol edits cannot
+        # update it.
+        self._apply_symbolic_trapezoid_constructor_bindings(
+            params=params,
+        )
+        self._add_variation_export_contract_tests(params=params)
+
         sequence_elements.update(
             {
                 "root.expo": EXPO_BLUEPRINT,
@@ -486,12 +578,43 @@ class GenericGammaStarDocumentBuilder:
                 else repetitions
             ),
         )
+        self._apply_computed_protocol_tables(params=params)
+
+        # Protocol expressions are emitted by _add_protocol().  Rebind the
+        # outer loop after that step so a derived repeat count is copied as a
+        # direct expression rather than routed through a second derived leaf.
+        # Some gammaSTAR editor versions do not reliably invalidate a
+        # dependency chain of the form n_y -> segments -> loop.length after an
+        # interactive protocol edit.  Copying the derived expression here
+        # produces the equivalent direct dependency
+        # n_y, ETL -> loop.length without introducing sequence semantics.
+        self._rebind_outer_loop_length_to_protocol_expression(
+            params=params,
+            loop_path=loop_path,
+            repeat_count_ref=repeat_count_ref,
+            repetitions=repetitions,
+        )
+        self._flatten_protocol_relationship_target(
+            params=params,
+            target_path=f"{loop_path}.length",
+        )
         if export_mode in {
             "compact_repeated_motif",
             "explicit_node_repeat",
             "explicit_materialized_repeat",
         }:
-            params["root.prot.seqstar_loop_length"] = _literal(repetitions)
+            loop_length_source = self._loop_length_protocol_source(
+                loop_path=loop_path,
+            )
+            if loop_length_source is not None:
+                params["root.prot.seqstar_loop_length"] = _expr(
+                    inputs={"count": f"root.prot.{loop_length_source}"},
+                    script="return count",
+                )
+            else:
+                params["root.prot.seqstar_loop_length"] = _literal(
+                    repetitions
+                )
         self._add_system(params=params)
         self._add_info(
             params=params,
@@ -512,7 +635,11 @@ class GenericGammaStarDocumentBuilder:
             params["root.info.seqstar_motif_length_blocks"] = _literal(
                 int(motif_info["motif_length"])
             )
-            params["root.info.seqstar_motif_repetitions"] = _literal(
+            params["root.info.seqstar_motif_repetitions"] = _expr(
+                inputs={"count": f"{loop_path}.length"},
+                script="return count",
+            )
+            params["root.info.seqstar_default_motif_repetitions"] = _literal(
                 int(motif_info["repetitions"])
             )
             if not compact_export:
@@ -543,14 +670,498 @@ class GenericGammaStarDocumentBuilder:
             kernel_path=kernel_path,
         )
 
+        if not compact_export:
+            self._rebuild_tests_after_final_hierarchy(params=params)
+
         if self.profile:
             print(f"[profile] gammaSTAR document build         {perf_counter() - total_start:9.3f} s")
 
-        return {
+        document = {
             "name": getattr(self.sequence, "name", "seqstar_sequence"),
             "parameters": params,
             "sequence_elements": _order_sequence_elements(sequence_elements),
         }
+
+        document["seqstar_writer_context"] = {
+            "used_realization": self.realization is not None,
+            "symbolic_sequence_name": getattr(
+                self.symbolic_sequence,
+                "name",
+                getattr(self.sequence, "name", "seqstar_sequence"),
+            ),
+            "numeric_sequence_name": getattr(
+                self.sequence,
+                "name",
+                "seqstar_sequence",
+            ),
+        }
+
+        diagnostics = getattr(self.realization, "diagnostics", None)
+        if diagnostics:
+            serialized = []
+            for diagnostic in diagnostics:
+                if hasattr(diagnostic, "to_dict"):
+                    serialized.append(diagnostic.to_dict())
+                elif isinstance(diagnostic, Mapping):
+                    serialized.append(dict(diagnostic))
+                else:
+                    serialized.append({"message": str(diagnostic)})
+            document["seqstar_writer_context"]["diagnostics"] = serialized
+
+        return document
+
+    def _apply_symbolic_trapezoid_constructor_bindings(
+        self,
+        *,
+        params: dict[str, Any],
+    ) -> None:
+        """Export live protocol bindings from trapezoid constructors.
+
+        A gradient can depend on protocol values without participating in a
+        loop variation.  GRE spoilers are the canonical example::
+
+            gx_spoil.area = 2 * n_x / fov
+            gy_spoil.area = 2 * n_y / fov
+
+        Resolution correctly rebuilds those gradients locally, but the generic
+        gammaSTAR document previously serialized the rebuilt waveform as a
+        literal.  Consequently, changing FOV on the gammaSTAR website updated
+        the phase-encode prephaser (which is exported through ``node.vary``) but
+        left the spoilers unchanged.
+
+        This pass recognizes area-only symbolic trapezoid constructors and
+        emits a protocol-driven shortest feasible trapezoid.  It also propagates
+        the dynamic duration into the event container and source block so later
+        blocks remain correctly positioned.  Explicitly varied gradients are
+        skipped because ``_apply_single_loop_variations_and_bindings`` already
+        owns their exported relationship.
+        """
+
+        affected_blocks: set[int] = set()
+
+        for event_id, event in self._event_container_events.items():
+            if not _is_gradient_event(event):
+                continue
+
+            leaf = self._event_container_leaves.get(event_id)
+            container = self._event_container_paths.get(event_id)
+            if not leaf or not container:
+                continue
+
+            metadata = getattr(event, "metadata", None)
+            constructor = (
+                metadata.get("symbolic_constructor")
+                if isinstance(metadata, Mapping)
+                else None
+            )
+            if not isinstance(constructor, Mapping):
+                parameters = getattr(event, "parameters", None)
+                constructor = (
+                    parameters.get("_symbolic_constructor")
+                    if isinstance(parameters, Mapping)
+                    else None
+                )
+            if not isinstance(constructor, Mapping):
+                continue
+            if str(constructor.get("family", "")).lower() != "trapezoid":
+                continue
+
+            specs = constructor.get("specs")
+            if not isinstance(specs, Mapping):
+                continue
+
+            area_spec = specs.get("area")
+            # Only promote constructor expressions that are driven entirely by
+            # protocol parameters. EventPropertyRef / anchor / block references
+            # are valid local symbolic expressions, but they cannot be compiled
+            # as root.prot relationships without first mapping them to exported
+            # event paths. Those expressions must retain the already-resolved
+            # literal waveform rather than aborting the whole gammaSTAR export.
+            if not _contains_parameter_reference(area_spec):
+                continue
+            if _contains_non_protocol_reference(area_spec):
+                continue
+
+            # A node.vary(..., attribute="area") relationship has already
+            # replaced this parameter.  Do not overwrite that stronger,
+            # counter-dependent binding.
+            if f"{leaf}.seqstar_variation_attribute" in params:
+                continue
+
+            # This implementation intentionally targets the common, generic
+            # area-only shortest-trapezoid constructor.  Fixed-duration or
+            # explicitly shaped trapezoids need a different feasibility model
+            # and remain serialized exactly as resolved.
+            if any(
+                specs.get(name) is not None
+                for name in (
+                    "amplitude",
+                    "duration",
+                    "fall_time",
+                    "flat_area",
+                    "flat_time",
+                    "rise_time",
+                )
+            ):
+                continue
+
+            area_inputs: dict[str, str] = {}
+            source_to_name: dict[str, str] = {}
+            try:
+                # Inline derived protocol parameters into the backend-consumed
+                # area target. gammaSTAR's interactive editor does not reliably
+                # invalidate transitive chains such as
+                # fov -> phase_encode_step -> spoiler.area -> spoiler.samples.
+                # The same generic compiler is already used for node.vary()
+                # targets and expands derived ParameterRef values to their
+                # primitive editable protocol controls.
+                area_body = self._variation_value_lua_expression(
+                    area_spec,
+                    inputs=area_inputs,
+                    source_to_name=source_to_name,
+                    target_path=f"{leaf}.area",
+                )
+            except TypeError as exc:
+                # A generic writer enhancement must never make a previously
+                # exportable sequence fail. Unsupported symbolic reference
+                # forms are left as the resolved literal waveform and recorded
+                # for diagnostics.
+                warnings = getattr(
+                    self,
+                    "_symbolic_trapezoid_binding_warnings",
+                    [],
+                )
+                warnings.append(
+                    {
+                        "event": str(getattr(event, "name", "<unnamed>")),
+                        "leaf": leaf,
+                        "reason": str(exc),
+                    }
+                )
+                self._symbolic_trapezoid_binding_warnings = warnings
+                continue
+            params[f"{leaf}.area"] = _expr(
+                inputs=area_inputs,
+                script=f"return {area_body}",
+            )
+
+            # Reproduce calculate_shortest_params_for_area() in gammaSTAR
+            # units.  Constructor area is in Hz/m*s (cycles/m); gammaSTAR
+            # waveform amplitudes are T/m, hence the division by gamma.
+            params[f"{leaf}.samples"] = _expr(
+                inputs={
+                    "area": f"{leaf}.area",
+                    "gamma": "root.sys.gamma",
+                    "grad_set": "root.gradient_settings",
+                },
+                script=(
+                    "local raster = grad_set.raster_time or 1e-5\n"
+                    "local max_grad = grad_set.max_grad_amp or 0.028\n"
+                    "local max_slew = grad_set.max_grad_slew or 150.0\n"
+                    "local area_si = (area or 0.0) / gamma\n"
+                    "if math.abs(area_si) < 1e-20 then\n"
+                    "  return {t={0.0, raster, 2*raster}, v={0.0, 0.0, 0.0}}\n"
+                    "end\n"
+                    "local function ceil_raster(value)\n"
+                    "  return math.ceil(value / raster - 1e-12) * raster\n"
+                    "end\n"
+                    "local rise = ceil_raster(math.sqrt(math.abs(area_si) / max_slew))\n"
+                    "if rise < raster then rise = raster end\n"
+                    "local effective = rise\n"
+                    "local amplitude = area_si / rise\n"
+                    "if math.abs(amplitude) > max_grad + 1e-12 then\n"
+                    "  effective = ceil_raster(math.abs(area_si) / max_grad)\n"
+                    "  amplitude = area_si / effective\n"
+                    "  rise = ceil_raster(math.abs(amplitude) / max_slew)\n"
+                    "  if rise < raster then rise = raster end\n"
+                    "end\n"
+                    "local flat = effective - rise\n"
+                    "if flat < 0 then flat = 0 end\n"
+                    "local duration = 2*rise + flat\n"
+                    "return {t={0.0, rise, rise+flat, duration}, \n"
+                    "        v={0.0, amplitude, amplitude, 0.0}}"
+                ),
+            )
+            params[f"{leaf}.duration"] = _expr(
+                inputs={"samples": f"{leaf}.samples"},
+                script=(
+                    "if samples == nil or samples.t == nil or #samples.t == 0 then return 0.0 end\n"
+                    "return samples.t[#samples.t]"
+                ),
+            )
+            params[f"{leaf}.max_abs_amplitude"] = _expr(
+                inputs={"samples": f"{leaf}.samples"},
+                script=(
+                    "local maxv = 0.0\n"
+                    "if samples == nil or samples.v == nil then return maxv end\n"
+                    "for i=1,#samples.v do\n"
+                    "  local value = math.abs(samples.v[i])\n"
+                    "  if value > maxv then maxv = value end\n"
+                    "end\n"
+                    "return maxv"
+                ),
+            )
+            params[f"{container}.duration"] = _expr(
+                inputs={"duration": f"{leaf}.duration"},
+                script="return duration",
+            )
+
+            block_index = _event_source_block_index_for_export(event)
+            if block_index is not None:
+                affected_blocks.add(int(block_index))
+
+        if not affected_blocks:
+            return
+
+        # Recompute affected source-block extents from the live event starts and
+        # durations.  Grouping later rewrites the event paths while preserving
+        # these dependencies.
+        records_by_index = {
+            int(record["index"]): record
+            for record in self._block_export_records
+        }
+        for block_index in sorted(affected_blocks):
+            record = records_by_index.get(block_index)
+            if record is None:
+                continue
+            block_path = str(record["path"])
+            inputs: dict[str, str] = {
+                "block_tstart": f"{block_path}.tstart"
+            }
+            lines = ["local max_end = block_tstart"]
+            event_number = 0
+            for event_id, event in self._event_container_events.items():
+                if _event_source_block_index_for_export(event) != block_index:
+                    continue
+                container = self._event_container_paths.get(event_id)
+                if not container:
+                    continue
+                t_name = f"tstart_{event_number}"
+                d_name = f"duration_{event_number}"
+                inputs[t_name] = f"{container}.tstart"
+                inputs[d_name] = f"{container}.duration"
+                lines.append(
+                    f"local event_end_{event_number} = {t_name} + {d_name}"
+                )
+                lines.append(
+                    f"if event_end_{event_number} > max_end then max_end = event_end_{event_number} end"
+                )
+                event_number += 1
+            lines.append("return max_end - block_tstart")
+            params[f"{block_path}.duration"] = _expr(
+                inputs=inputs,
+                script="\n".join(lines),
+            )
+
+        # Preserve the requested TR when a protocol edit lengthens a late block
+        # such as GRE spoiling.  The repetition-fill block starts after all
+        # preceding blocks, so its duration is simply TR minus its live tstart.
+        for record in self._block_export_records:
+            role = str(
+                _block_role(record["block"])
+                or record.get("local_name")
+                or ""
+            ).lower()
+            if role not in {
+                "repetition_time_fill",
+                "repetition_fill",
+                "tr_fill",
+                "repetition_delay",
+            }:
+                continue
+            block_path = str(record["path"])
+            params[f"{block_path}.duration"] = _expr(
+                inputs={
+                    "tr": "root.prot.TR",
+                    "tstart": f"{block_path}.tstart",
+                },
+                script=(
+                    "local remaining = tr - tstart\n"
+                    "if remaining < 0 then return 0.0 end\n"
+                    "return remaining"
+                ),
+            )
+
+    def _add_variation_export_contract_tests(
+        self,
+        *,
+        params: dict[str, Any],
+    ) -> None:
+        """Expose variation export coverage as gammaSTAR-visible tests.
+
+        These tests are intentionally lightweight and sequence-agnostic.  They
+        make failures in the central ``node.vary`` contract visible in the JSON
+        without requiring a Python debugger:
+
+        * every registered variation should map to at least one backend target;
+        * RF/ADC phase-like variations should drive the backend-consumed
+          ``.phase`` field, not only a metadata alias such as ``.phase_offset``;
+        * each exported target must be present and relationship-backed.
+        """
+
+        records = list(getattr(self, "_variation_export_records", []))
+        params["root.info.seqstar_variation_exports"] = _literal(records)
+        params["root.info.seqstar_variation_export_count"] = _literal(
+            len(records)
+        )
+
+        warnings: list[dict[str, Any]] = []
+        for record in records:
+            targets = [str(path) for path in record.get("targets", [])]
+            attribute = str(record.get("attribute", "")).lower()
+            event_type = str(record.get("event_type", "")).lower()
+
+            if not targets:
+                warnings.append(
+                    {
+                        "kind": "variation_has_no_export_target",
+                        "event": record.get("event_name"),
+                        "attribute": record.get("attribute"),
+                        "leaf": record.get("leaf"),
+                    }
+                )
+                continue
+
+            if event_type in {"rf", "adc"} and attribute in {
+                "phase",
+                "phase_offset",
+                "rf_phase",
+                "adc_phase",
+                "rf_phase_offset",
+                "adc_phase_offset",
+            }:
+                phase_target = f"{record.get('leaf')}.phase"
+                if phase_target not in targets:
+                    warnings.append(
+                        {
+                            "kind": "phase_variation_not_backend_consumed",
+                            "event": record.get("event_name"),
+                            "attribute": record.get("attribute"),
+                            "expected_target": phase_target,
+                        }
+                    )
+
+            for target in targets:
+                parameter = params.get(target)
+                if not isinstance(parameter, Mapping):
+                    warnings.append(
+                        {
+                            "kind": "variation_target_missing",
+                            "event": record.get("event_name"),
+                            "attribute": record.get("attribute"),
+                            "target": target,
+                        }
+                    )
+                    continue
+                inputs = parameter.get("inputs")
+                if not isinstance(inputs, Mapping) or not inputs:
+                    warnings.append(
+                        {
+                            "kind": "variation_target_not_relationship",
+                            "event": record.get("event_name"),
+                            "attribute": record.get("attribute"),
+                            "target": target,
+                        }
+                    )
+
+        params["root.info.seqstar_variation_export_warnings"] = _literal(
+            warnings
+        )
+        params["root.info.seqstar_variation_export_warning_count"] = _literal(
+            len(warnings)
+        )
+        params["root.tests.seqstar_variations_exported"] = _expr(
+            inputs={
+                "warning_count": (
+                    "root.info.seqstar_variation_export_warning_count"
+                )
+            },
+            script="return warning_count == 0",
+        )
+
+    def _apply_computed_protocol_tables(
+        self,
+        *,
+        params: dict[str, Any],
+    ) -> None:
+        """Replace declared protocol tables with live, dependency-driven forms.
+
+        Demos may place specifications under
+        ``protocol.metadata["computed_protocol_tables"]``. The writer only
+        implements reusable table generators and does not inspect sequence
+        names, event names, or TSE-specific node paths.
+        """
+
+        protocol = getattr(self.symbolic_sequence, "protocol", None)
+        metadata = getattr(protocol, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            return
+        specifications = metadata.get("computed_protocol_tables")
+        if not isinstance(specifications, Mapping):
+            return
+
+        for table_name, specification in specifications.items():
+            if not isinstance(specification, Mapping):
+                continue
+            generator = str(specification.get("generator") or "").strip()
+            inputs = specification.get("inputs")
+            if not isinstance(inputs, Mapping):
+                continue
+
+            table_path = f"root.prot.{_protocol_key(str(table_name))}"
+            if generator == "phase_encode_order_table":
+                required = (
+                    "n_y",
+                    "echo_train_length",
+                    "order",
+                    "center_echo_index",
+                )
+                if any(key not in inputs for key in required):
+                    continue
+                params[table_path] = _expr(
+                    inputs={
+                        key: f"root.prot.{_protocol_key(str(inputs[key]))}"
+                        for key in required
+                    },
+                    script=(
+                        "local ny = math.floor((n_y or 1) + 0.5)\n"
+                        "local etl = math.floor((echo_train_length or 1) + 0.5)\n"
+                        "if ny < 1 or etl < 1 or ny % etl ~= 0 then return {} end\n"
+                        "local nshots = ny / etl\n"
+                        "local key = string.lower(tostring(order or 'linear'))\n"
+                        "local acquisition = {}\n"
+                        "if key == 'reverse' then\n"
+                        "  for i=1,ny do acquisition[i] = ny/2 - i end\n"
+                        "elseif key == 'centric' then\n"
+                        "  acquisition[1] = 0\n"
+                        "  local k = 2\n"
+                        "  local radius = 1\n"
+                        "  while k <= ny do\n"
+                        "    acquisition[k] = -radius; k = k + 1\n"
+                        "    if k <= ny then acquisition[k] = radius; k = k + 1 end\n"
+                        "    radius = radius + 1\n"
+                        "  end\n"
+                        "else\n"
+                        "  for i=1,ny do acquisition[i] = -ny/2 + (i-1) end\n"
+                        "end\n"
+                        "local zero_index = 1\n"
+                        "for i=1,ny do if acquisition[i] == 0 then zero_index = i; break end end\n"
+                        "local zero_col = math.floor((zero_index-1)/nshots)\n"
+                        "local target_col = math.floor((center_echo_index or 0) + 0.5)\n"
+                        "local shift = target_col - zero_col\n"
+                        "local table_out = {}\n"
+                        "for row=0,nshots-1 do\n"
+                        "  local line = {}\n"
+                        "  for col=0,etl-1 do\n"
+                        "    local source_col = (col - shift) % etl\n"
+                        "    local source_index = row + source_col*nshots + 1\n"
+                        "    line[col+1] = acquisition[source_index]\n"
+                        "  end\n"
+                        "  table_out[row+1] = line\n"
+                        "end\n"
+                        "return table_out"
+                    ),
+                )
 
     def _apply_nested_loop_structure_and_bindings(
         self,
@@ -604,9 +1215,25 @@ class GenericGammaStarDocumentBuilder:
         params[f"{inner_loop}.counter"] = _literal(0)
 
         inner_count_ref = inner_record.get("repeat_count")
-        if isinstance(inner_count_ref, str):
+        inner_count_source = _protocol_source_name_from_value(
+            inner_count_ref,
+            self._live_protocol_values,
+        )
+        if inner_count_source is None:
+            symbolic_registry = _sequence_node_registry_for_export(
+                self.symbolic_sequence
+            )
+            symbolic_inner = symbolic_registry.get(inner_name, {})
+            if isinstance(symbolic_inner, Mapping):
+                inner_count_source = _protocol_source_name_from_value(
+                    symbolic_inner.get("repeat_count"),
+                    self._live_protocol_values,
+                )
+        if inner_count_source is not None:
             params[f"{inner_loop}.length"] = _expr(
-                inputs={"count": f"root.prot.{inner_count_ref}"},
+                inputs={
+                    "count": f"root.prot.{_protocol_key(inner_count_source)}"
+                },
                 script="return count",
             )
         else:
@@ -615,15 +1242,32 @@ class GenericGammaStarDocumentBuilder:
             )
 
         inner_period_ref = inner_record.get("repeat_every")
-        if isinstance(inner_period_ref, str):
+        inner_period_source = _protocol_source_name_from_value(
+            inner_period_ref,
+            self._live_protocol_values,
+        )
+        if inner_period_source is None:
+            symbolic_registry = _sequence_node_registry_for_export(
+                self.symbolic_sequence
+            )
+            symbolic_inner = symbolic_registry.get(inner_name, {})
+            if isinstance(symbolic_inner, Mapping):
+                inner_period_source = _protocol_source_name_from_value(
+                    symbolic_inner.get("repeat_every"),
+                    self._live_protocol_values,
+                )
+        if inner_period_source is not None:
+            period_path = (
+                f"root.prot.{_protocol_key(inner_period_source)}"
+            )
             params[f"{inner_loop}.duration"] = _expr(
-                inputs={"period": f"root.prot.{inner_period_ref}"},
+                inputs={"period": period_path},
                 script="return period",
             )
             params[f"{inner_loop}.tstart"] = _expr(
                 inputs={
                     "counter": f"{inner_loop}.counter",
-                    "period": f"root.prot.{inner_period_ref}",
+                    "period": period_path,
                 },
                 script="return counter * period",
             )
@@ -690,6 +1334,11 @@ class GenericGammaStarDocumentBuilder:
         # once; only amplitude is selected by shot/echo counters.
         for event_id, event in self._event_container_events.items():
             metadata = getattr(event, "metadata", None)
+            expression_binding = (
+                metadata.get("seqstar_nested_loop_expression_binding")
+                if isinstance(metadata, Mapping)
+                else None
+            )
             binding = (
                 metadata.get("seqstar_nested_loop_binding")
                 if isinstance(metadata, Mapping)
@@ -701,7 +1350,12 @@ class GenericGammaStarDocumentBuilder:
                     "_seqstar_nested_loop_binding",
                     None,
                 )
-            if not isinstance(binding, Mapping):
+            active_binding = (
+                expression_binding
+                if isinstance(expression_binding, Mapping)
+                else binding
+            )
+            if not isinstance(active_binding, Mapping):
                 continue
 
             leaf = self._event_container_leaves.get(event_id)
@@ -734,6 +1388,48 @@ class GenericGammaStarDocumentBuilder:
             params[f"{leaf}.normalized_samples"] = _literal(
                 {"t": times, "v": normalized_values}
             )
+
+            if isinstance(expression_binding, Mapping):
+                protocol_inputs = expression_binding.get("protocol_inputs", {})
+                loop_inputs = expression_binding.get("loop_inputs", {})
+                script = str(expression_binding.get("script") or "return 0")
+                if not isinstance(protocol_inputs, Mapping):
+                    protocol_inputs = {}
+                if not isinstance(loop_inputs, Mapping):
+                    loop_inputs = {}
+
+                expression_inputs = {
+                    str(alias): f"root.prot.{_protocol_key(str(source))}"
+                    for alias, source in protocol_inputs.items()
+                }
+                for alias, source in loop_inputs.items():
+                    source_key = str(source).strip().lower()
+                    if source_key == "outer":
+                        expression_inputs[str(alias)] = f"{outer_loop}.counter"
+                    elif source_key == "inner":
+                        expression_inputs[str(alias)] = f"{inner_loop}.counter"
+                    else:
+                        expression_inputs[str(alias)] = str(source)
+
+                params[f"{leaf}.area"] = _expr(
+                    inputs=expression_inputs,
+                    script=script,
+                )
+                sample_inputs = {"shape": f"{leaf}.normalized_samples"}
+                sample_inputs.update(expression_inputs)
+                params[samples_key] = _expr(
+                    inputs=sample_inputs,
+                    script=(
+                        "local function seqstar_area()\n"
+                        + script
+                        + "\nend\n"
+                        "local area = seqstar_area()\n"
+                        "local out = {t=shape.t, v={}}\n"
+                        "for i=1,#shape.v do out.v[i] = shape.v[i] * area end\n"
+                        "return out"
+                    ),
+                )
+                continue
 
             protocol_table = str(
                 binding.get("protocol_table", "phase_encode_steps")
@@ -768,6 +1464,661 @@ class GenericGammaStarDocumentBuilder:
                     f"return table[si][ei] * {scale!r}"
                 ),
             )
+
+    def _apply_single_loop_variations_and_bindings(
+        self,
+        *,
+        params: dict[str, Any],
+        loop_path: str,
+    ) -> None:
+        """Apply one-dimensional loop variation metadata to exported events.
+
+        ``kernel.vary(vary(event, "area", strength=..., step=...))`` attaches a
+        declarative binding to the event.  For a single active loop, the writer
+        should not leave the event waveform literal; it should scale the shape
+        by the loop counter.
+
+        This pass is sequence-agnostic.  It does not know GRE/EPI.  It consumes
+        event metadata written by ``SeqStarSequence._register_node_variation``
+        and rewrites the exported event's selected property.
+        """
+
+        counter_path = f"{loop_path}.counter"
+        if counter_path not in params:
+            return
+
+        for event_id, event in list(self._event_container_events.items()):
+            binding = self._variation_binding_for_event(event)
+            if not isinstance(binding, Mapping):
+                continue
+
+            attribute = str(binding.get("attribute") or "").strip().lower()
+            leaf = self._event_container_leaves.get(event_id)
+            if not leaf:
+                continue
+
+            export_targets = self._variation_export_targets(
+                event=event,
+                leaf=leaf,
+                attribute=attribute,
+                params=params,
+            )
+            if not export_targets:
+                self._record_variation_export(
+                    event=event,
+                    leaf=leaf,
+                    binding=binding,
+                    attribute=attribute,
+                    targets=[],
+                    status="unsupported_attribute",
+                )
+                continue
+
+            if _is_gradient_event(event) and attribute in {"area", "amplitude"}:
+                self._apply_single_loop_gradient_variation(
+                    params=params,
+                    event=event,
+                    leaf=leaf,
+                    binding=binding,
+                    counter_path=counter_path,
+                    attribute=attribute,
+                )
+                self._record_variation_export(
+                    event=event,
+                    leaf=leaf,
+                    binding=binding,
+                    attribute=attribute,
+                    targets=export_targets,
+                    status="exported",
+                )
+                continue
+
+            for target in export_targets:
+                self._write_single_loop_linear_value(
+                    params=params,
+                    path=target,
+                    binding=binding,
+                    counter_path=counter_path,
+                )
+
+            self._record_variation_export(
+                event=event,
+                leaf=leaf,
+                binding=binding,
+                attribute=attribute,
+                targets=export_targets,
+                status="exported",
+            )
+
+    def _variation_export_targets(
+        self,
+        *,
+        event: Any,
+        leaf: str,
+        attribute: str,
+        params: Mapping[str, Any],
+    ) -> list[str]:
+        """Return gammaSTAR parameter paths affected by a public variation.
+
+        ``node.vary()`` is a semantic API.  The developer varies event
+        properties such as ``phase_offset`` or ``area``; each writer maps that
+        semantic property onto the fields consumed by its backend.
+
+        For gammaSTAR, RF/ADC basic representations consume ``.phase`` and
+        ``.frequency``.  PyPulseq-style event objects expose
+        ``phase_offset``/``freq_offset``.  Therefore a variation of
+        ``phase_offset`` on RF/ADC must update the consumed ``.phase`` field;
+        otherwise the relationship is exported but has no effect on the
+        website plot or executable representation.
+
+        The original semantic alias is also exported when possible for
+        traceability/debugging.  This keeps the abstraction generic and avoids
+        GRE-specific RF-spoiling logic.
+        """
+
+        attr = str(attribute or "").strip().lower()
+        targets: list[str] = []
+
+        def add(suffix: str) -> None:
+            path = f"{leaf}.{suffix}"
+            if path not in targets:
+                targets.append(path)
+
+        if _is_gradient_event(event):
+            if attr in {"area", "amplitude"}:
+                add(attr)
+            return targets
+
+        if _is_rf_event(event) or _is_adc_event(event):
+            phase_aliases = {
+                "phase",
+                "phase_offset",
+                "rf_phase",
+                "adc_phase",
+                "rf_phase_offset",
+                "adc_phase_offset",
+            }
+            frequency_aliases = {
+                "frequency",
+                "freq_offset",
+                "frequency_offset",
+                "rf_frequency",
+                "adc_frequency",
+                "rf_frequency_offset",
+                "adc_frequency_offset",
+            }
+
+            if attr in phase_aliases:
+                # Backend-consumed field first.
+                add("phase")
+                # Preserve public/developer-facing spelling for inspection.
+                if attr != "phase":
+                    add(attr)
+                if attr != "phase_offset":
+                    add("phase_offset")
+                return targets
+
+            if attr in frequency_aliases:
+                add("frequency")
+                if attr != "frequency":
+                    add(attr)
+                if attr not in {"freq_offset", "frequency_offset"}:
+                    add("frequency_offset")
+                return targets
+
+        # Last-resort generic path: if the backend already exposes a parameter
+        # of the same name, vary it.  This lets custom event objects extend the
+        # contract without modifying the writer.
+        if f"{leaf}.{attr}" in params:
+            add(attr)
+
+        return targets
+
+    def _record_variation_export(
+        self,
+        *,
+        event: Any,
+        leaf: str,
+        binding: Mapping[str, Any],
+        attribute: str,
+        targets: list[str],
+        status: str,
+    ) -> None:
+        """Store an auditable variation-export record for validators/tests."""
+
+        records = getattr(self, "_variation_export_records", None)
+        if records is None:
+            records = []
+            self._variation_export_records = records
+
+        records.append(
+            {
+                "event_name": str(
+                    getattr(event, "name", None)
+                    or getattr(event, "path", None)
+                    or event.__class__.__name__
+                ),
+                "event_type": (
+                    "gradient"
+                    if _is_gradient_event(event)
+                    else "rf"
+                    if _is_rf_event(event)
+                    else "adc"
+                    if _is_adc_event(event)
+                    else event.__class__.__name__
+                ),
+                "leaf": str(leaf),
+                "attribute": str(attribute),
+                "targets": [str(target) for target in targets],
+                "node": str(binding.get("node", "")),
+                "counter": str(binding.get("counter", "")),
+                "mode": str(binding.get("mode", "linear")),
+                "status": str(status),
+            }
+        )
+
+    def _apply_single_loop_gradient_variation(
+        self,
+        *,
+        params: dict[str, Any],
+        event: Any,
+        leaf: str,
+        binding: Mapping[str, Any],
+        counter_path: str,
+        attribute: str,
+    ) -> None:
+        """Scale a gradient waveform by a loop-varying area/amplitude."""
+
+        samples_key = f"{leaf}.samples"
+        if samples_key not in params:
+            return
+
+        grad_data = self._gradient_waveform_data(gradient_event=event)
+        samples = grad_data.get("samples") or {}
+        times = list(samples.get("t", []))
+        values = list(samples.get("v", []))
+        if not values:
+            return
+
+        # Prefer area normalization because GRE phase encoding varies area.  If
+        # area is unavailable and the user varied amplitude, fall back to max
+        # absolute amplitude normalization.
+        area = _safe_float_or_none(grad_data.get("area"))
+        max_abs = _safe_float_or_none(grad_data.get("max_abs_amplitude"))
+        if area is not None and abs(area) > 1e-20:
+            scale0 = area
+        elif max_abs is not None and abs(max_abs) > 1e-20:
+            scale0 = max_abs
+        else:
+            return
+
+        normalized_values = [float(v) / scale0 for v in values]
+        params[f"{leaf}.normalized_samples"] = _literal(
+            {"t": times, "v": normalized_values}
+        )
+
+        varying_value_path = f"{leaf}.{attribute}"
+        self._write_single_loop_linear_value(
+            params=params,
+            path=varying_value_path,
+            binding=binding,
+            counter_path=counter_path,
+        )
+
+        if attribute == "area":
+            params[samples_key] = _expr(
+                inputs={
+                    "shape": f"{leaf}.normalized_samples",
+                    "area": varying_value_path,
+                },
+                script=(
+                    "local out = {t=shape.t, v={}}\n"
+                    "for i=1,#shape.v do out.v[i] = shape.v[i] * area end\n"
+                    "return out"
+                ),
+            )
+            params[f"{leaf}.max_abs_amplitude"] = _expr(
+                inputs={
+                    "shape": f"{leaf}.normalized_samples",
+                    "area": varying_value_path,
+                },
+                script=(
+                    "local maxv = 0\n"
+                    "for i=1,#shape.v do\n"
+                    "  local v = math.abs(shape.v[i] * area)\n"
+                    "  if v > maxv then maxv = v end\n"
+                    "end\n"
+                    "return maxv"
+                ),
+            )
+        else:
+            params[samples_key] = _expr(
+                inputs={
+                    "shape": f"{leaf}.normalized_samples",
+                    "amplitude": varying_value_path,
+                },
+                script=(
+                    "local out = {t=shape.t, v={}}\n"
+                    "for i=1,#shape.v do out.v[i] = shape.v[i] * amplitude end\n"
+                    "return out"
+                ),
+            )
+            params[f"{leaf}.max_abs_amplitude"] = _expr(
+                inputs={"amplitude": varying_value_path},
+                script="return math.abs(amplitude)",
+            )
+
+        params[f"{leaf}.seqstar_variation_attribute"] = _literal(attribute)
+        params[f"{leaf}.seqstar_variation_counter"] = _literal(counter_path)
+
+    def _variation_value_lua_expression(
+        self,
+        value: Any,
+        *,
+        inputs: dict[str, str],
+        source_to_name: dict[str, str],
+        target_path: str,
+        seen_protocol_keys: set[str] | None = None,
+    ) -> str:
+        """Compile a variation value while inlining derived protocol refs.
+
+        gammaSTAR currently does not always invalidate transitive protocol
+        dependencies in the live editor, e.g.
+
+            root.prot.n_y -> root.prot.phase_encode_start -> gy.grad.area
+
+        The JSON relationship is valid, but the plot may keep the old value of
+        the intermediate derived parameter.  For loop-varying event properties,
+        the plot target should therefore depend directly on the editable source
+        protocol controls whenever the intermediate protocol parameter is itself
+        a derived expression.
+
+        This is generic expression inlining. It does not know GRE, EPI, ky,
+        phase encoding, n_y, or fov.  It simply expands ParameterRef(X) when X
+        is present in the merged live protocol table as another expression.
+        """
+
+        seen = set(seen_protocol_keys or ())
+
+        if _is_seqstar_expression(value):
+            if hasattr(value, "canonical_name"):
+                canonical = str(value.canonical_name)
+                gamma_key = _protocol_key(canonical)
+                live_value = self._live_protocol_values.get(canonical)
+                if live_value is None:
+                    live_value = self._live_protocol_values.get(gamma_key)
+
+                if (
+                    live_value is not None
+                    and _contains_protocol_expression(live_value)
+                    and canonical not in seen
+                    and gamma_key not in seen
+                ):
+                    return self._variation_value_lua_expression(
+                        live_value,
+                        inputs=inputs,
+                        source_to_name=source_to_name,
+                        target_path=target_path,
+                        seen_protocol_keys=seen | {canonical, gamma_key},
+                    )
+
+                source_path = f"root.prot.{gamma_key}"
+                if source_path == target_path:
+                    raise TypeError(
+                        f"Variation expression for {target_path!r} references itself."
+                    )
+                if source_path not in source_to_name:
+                    name = _safe_input_name(source_path)
+                    base = name
+                    suffix = 2
+                    used = set(inputs)
+                    while name in used:
+                        name = f"{base}_{suffix}"
+                        suffix += 1
+                    source_to_name[source_path] = name
+                    inputs[name] = source_path
+                return source_to_name[source_path]
+
+            if hasattr(value, "value") and not hasattr(value, "operator_name"):
+                return _to_lua(value.value)
+
+            operator_name = getattr(value, "operator_name", None)
+
+            if operator_name is not None and hasattr(value, "operand"):
+                operand = self._variation_value_lua_expression(
+                    value.operand,
+                    inputs=inputs,
+                    source_to_name=source_to_name,
+                    target_path=target_path,
+                    seen_protocol_keys=seen,
+                )
+                if operator_name == "neg":
+                    return f"(-({operand}))"
+
+            if (
+                operator_name is not None
+                and hasattr(value, "left")
+                and hasattr(value, "right")
+            ):
+                left = self._variation_value_lua_expression(
+                    value.left,
+                    inputs=inputs,
+                    source_to_name=source_to_name,
+                    target_path=target_path,
+                    seen_protocol_keys=seen,
+                )
+                right = self._variation_value_lua_expression(
+                    value.right,
+                    inputs=inputs,
+                    source_to_name=source_to_name,
+                    target_path=target_path,
+                    seen_protocol_keys=seen,
+                )
+                operator_map = {
+                    "add": "+",
+                    "sub": "-",
+                    "mul": "*",
+                    "truediv": "/",
+                    "pow": "^",
+                }
+                if operator_name in operator_map:
+                    return f"(({left}) {operator_map[operator_name]} ({right}))"
+
+            raise TypeError(
+                "Cannot compile variation expression to Lua: "
+                f"{type(value).__name__}."
+            )
+
+        return _to_lua(value)
+
+    def _write_single_loop_linear_value(
+        self,
+        *,
+        params: dict[str, Any],
+        path: str,
+        binding: Mapping[str, Any],
+        counter_path: str,
+    ) -> None:
+        """Write value = strength + counter * step, with optional wrap.
+
+        The helper parameters are still exported for inspectability, but the
+        plotted target expression inlines derived protocol expressions so live
+        protocol edits can invalidate the actual plotted waveform even if the
+        UI does not propagate through intermediate derived protocol nodes.
+        """
+
+        strength_path = f"{path}_variation_strength"
+        step_path = f"{path}_variation_step"
+        wrap_path = f"{path}_variation_wrap"
+
+        strength_value = binding.get("strength")
+        step_value = binding.get("step")
+
+        params[strength_path] = self._variation_scalar_parameter(
+            strength_value,
+            fallback=0.0,
+        )
+        params[step_path] = self._variation_scalar_parameter(
+            step_value,
+            fallback=0.0,
+        )
+
+        inputs: dict[str, str] = {"counter": counter_path}
+        source_to_name: dict[str, str] = {}
+
+        try:
+            strength_lua = self._variation_value_lua_expression(
+                strength_value,
+                inputs=inputs,
+                source_to_name=source_to_name,
+                target_path=path,
+            )
+        except Exception:
+            inputs["strength"] = strength_path
+            strength_lua = "strength"
+
+        try:
+            step_lua = self._variation_value_lua_expression(
+                step_value,
+                inputs=inputs,
+                source_to_name=source_to_name,
+                target_path=path,
+            )
+        except Exception:
+            inputs["step"] = step_path
+            step_lua = "step"
+
+        script = (
+            f"local value = ({strength_lua}) + (counter or 0) * ({step_lua})\n"
+        )
+
+        wrap = binding.get("wrap")
+        if wrap is not None:
+            params[wrap_path] = self._variation_scalar_parameter(
+                wrap,
+                fallback=None,
+            )
+            try:
+                wrap_lua = self._variation_value_lua_expression(
+                    wrap,
+                    inputs=inputs,
+                    source_to_name=source_to_name,
+                    target_path=path,
+                )
+            except Exception:
+                inputs["wrap"] = wrap_path
+                wrap_lua = "wrap"
+            script += (
+                f"local wrap_value = {wrap_lua}\n"
+                "if wrap_value ~= nil and wrap_value ~= 0 then\n"
+                "  value = value % wrap_value\n"
+                "end\n"
+            )
+
+        script += "return value"
+        params[path] = _expr(inputs=inputs, script=script)
+
+        if _gammastar_debug_enabled():
+            _gammastar_debug(
+                "linear variation wrote/direct "
+                f"path={path} "
+                f"inputs={inputs!r} "
+                f"script={script!r} "
+                f"strength_helper={params.get(strength_path)!r} "
+                f"step_helper={params.get(step_path)!r}"
+            )
+
+    def _variation_scalar_parameter(
+        self,
+        value: Any,
+        *,
+        fallback: float | None,
+    ) -> dict[str, Any]:
+        """Return a scalar variation value.
+
+        Direct protocol references may remain live.  Compound symbolic
+        expressions must *not* be collapsed to any token they merely contain.
+        For example, ``-0.5 * n_y / fov`` contains ``fov``, but it is not equal
+        to ``fov``.  The v23 writer used broad token-containment matching here,
+        which incorrectly exported both GRE phase-encode strength and step as
+        ``root.prot.fov``.  For v0.2, compound expressions are evaluated to the
+        current protocol defaults; full symbolic parameter-range propagation
+        remains the v0.3 feasibility-engine task.
+        """
+
+        # Only preserve genuinely direct protocol references as live links.
+        # Do not use the broad token-containment fallback in
+        # _protocol_source_name_from_value(), because variation expressions are
+        # often compound expressions containing several protocol tokens.
+        source = _direct_protocol_source_name_from_value(
+            value,
+            self._live_protocol_values,
+        )
+        if source is not None:
+            return _expr(
+                inputs={"value": f"root.prot.{_protocol_key(source)}"},
+                script="return value",
+            )
+
+        numeric = _safe_float_or_none(value)
+        if numeric is None and hasattr(value, "eval"):
+            for context in (
+                self.realization,
+                self.sequence,
+                self.symbolic_sequence,
+                getattr(self.sequence, "protocol", None),
+                getattr(self.symbolic_sequence, "protocol", None),
+            ):
+                try:
+                    numeric = _safe_float_or_none(value.eval(context))
+                except Exception:
+                    numeric = None
+                if numeric is not None:
+                    break
+
+        if numeric is None:
+            numeric = fallback
+
+        return _literal(numeric)
+
+    def _variation_numeric_default(self, value: Any) -> float | None:
+        """Evaluate a relationship value at the writer's current defaults.
+
+        This helper is deliberately sequence-agnostic.  It knows nothing about
+        EPI, FOV, matrix size, or gradient roles; it only evaluates the value
+        declared by ``node.vary(...)`` using the available realization/protocol
+        contexts.
+        """
+
+        numeric = _safe_float_or_none(value)
+        if numeric is not None:
+            return numeric
+
+        if hasattr(value, "eval"):
+            for context in (
+                self.realization,
+                self.sequence,
+                self.symbolic_sequence,
+                getattr(self.sequence, "protocol", None),
+                getattr(self.symbolic_sequence, "protocol", None),
+            ):
+                if context is None:
+                    continue
+                try:
+                    numeric = _safe_float_or_none(value.eval(context))
+                except Exception:
+                    numeric = None
+                if numeric is not None:
+                    return numeric
+
+        return None
+
+    def _variation_binding_for_event(self, event: Any) -> Mapping[str, Any] | None:
+        """Return the first loop variation binding associated with an event."""
+
+        metadata = getattr(event, "metadata", None)
+        if isinstance(metadata, Mapping):
+            value = metadata.get("seqstar_loop_binding")
+            if isinstance(value, Mapping):
+                return value
+            variations = metadata.get("seqstar_variations")
+            if isinstance(variations, Iterable):
+                for item in variations:
+                    if isinstance(item, Mapping):
+                        return item
+
+        parameters = getattr(event, "parameters", None)
+        if isinstance(parameters, Mapping):
+            variations = parameters.get("_seqstar_variations")
+            if isinstance(variations, Iterable):
+                for item in variations:
+                    if isinstance(item, Mapping):
+                        return item
+
+        # A resolved/deepcopied event can lose Python object identity.  Fall
+        # back to matching the variation record by event name from the sequence
+        # node registry.
+        event_name = str(
+            getattr(event, "name", None)
+            or getattr(event, "path", None)
+            or event.__class__.__name__
+        )
+        registry = _sequence_node_registry_for_export(
+            self.symbolic_sequence or self.sequence
+        )
+        for record in registry.values():
+            if not isinstance(record, Mapping):
+                continue
+            variations = record.get("variations")
+            if not isinstance(variations, Iterable):
+                continue
+            for item in variations:
+                if not isinstance(item, Mapping):
+                    continue
+                names = item.get("event_names")
+                if isinstance(names, Iterable) and event_name in {str(name) for name in names}:
+                    return item
+        return None
 
     def _add_seqstar_block_timing_dependencies(
         self,
@@ -1533,6 +2884,30 @@ class GenericGammaStarDocumentBuilder:
 
         num_segments = len(windows)
 
+        first_window_for_timing = windows[0]
+        default_adc_duration = float(
+            _adc_window_value(first_window_for_timing, "duration", 0.0)
+        )
+        first_window_metadata = _adc_window_value(
+            first_window_for_timing,
+            "metadata",
+            {},
+        )
+        if not isinstance(first_window_metadata, Mapping):
+            first_window_metadata = {}
+
+        default_adc_delay = float(
+            _adc_window_value(
+                first_window_for_timing,
+                "event_delay",
+                _adc_window_value(
+                    first_window_for_timing,
+                    "readout_delay",
+                    first_window_metadata.get("event_delay", 0.0),
+                ),
+            )
+        )
+
         # Infer the regular segment period from consecutive ADC-window starts.
         window_starts = [
             float(
@@ -1708,8 +3083,15 @@ class GenericGammaStarDocumentBuilder:
                 },
                 script="return duration",
             )
-            params[f"{leaf_path}.direction"] = _literal(
+            params[f"{leaf_path}.logical_axis"] = _literal(
+                _gradient_logical_axis_for_orientation(event)
+            )
+            params[f"{leaf_path}.direction_fallback"] = _literal(
                 grad_data["direction"]
+            )
+            params[f"{leaf_path}.direction"] = self._gradient_direction_parameter(
+                gradient_event=event,
+                fallback_direction=grad_data["direction"],
             )
             params[f"{leaf_path}.channel"] = _literal(
                 grad_data.get("channel")
@@ -1723,19 +3105,210 @@ class GenericGammaStarDocumentBuilder:
             params[f"{leaf_path}.enabled"] = _literal(
                 bool(grad_data.get("enabled", True))
             )
-            params[f"{leaf_path}.segment_samples"] = _literal(
-                item["segment_table"]
+            # Preserve a generic outer-loop gradient variation when the full
+            # train is lowered into one segment per inner readout iteration.
+            # The segment table stores normalized waveform pieces and the
+            # selected piece is scaled by the live varied area/amplitude. This
+            # is not EPI-specific; it applies to any synchronized arbitrary
+            # gradient train carrying a SeqStar loop variation.
+            binding = self._variation_binding_for_event(event)
+            attribute = str(
+                binding.get("attribute") if isinstance(binding, Mapping) else ""
+            ).strip().lower()
+
+            total_area = _safe_float_or_none(grad_data.get("area"))
+            max_abs = _safe_float_or_none(
+                grad_data.get("max_abs_amplitude")
             )
-            params[f"{leaf_path}.samples"] = _expr(
-                inputs={
-                    "segments": f"{leaf_path}.segment_samples",
-                    "counter": f"{readout_loop_path}.counter",
-                },
-                script=(
-                    "local idx = (counter or 0) + 1\n"
-                    "return segments[idx] or segments[1]"
-                ),
+
+            # Normalize against the *declared variation value at counter zero*,
+            # not against an implementation-specific gradient-data area.  Some
+            # arbitrary-gradient adapters report area in a representation whose
+            # units differ from the waveform samples.  Dividing samples by that
+            # value can collapse a valid waveform to nearly zero.  The declared
+            # strength is the generic relationship contract: at the exported
+            # defaults, multiplying the normalized waveform by strength must
+            # reproduce the original waveform exactly.
+            declared_scale = None
+            if isinstance(binding, Mapping):
+                declared_scale = self._variation_numeric_default(
+                    binding.get("strength")
+                )
+
+            can_scale_area = (
+                attribute == "area"
+                and declared_scale is not None
+                and abs(declared_scale) > 1e-20
             )
+            can_scale_amplitude = (
+                attribute == "amplitude"
+                and declared_scale is not None
+                and abs(declared_scale) > 1e-20
+            )
+
+            if isinstance(binding, Mapping) and (
+                can_scale_area or can_scale_amplitude
+            ):
+                scale0 = declared_scale
+                normalized_segments = []
+                for segment in item["segment_table"]:
+                    normalized_segments.append(
+                        {
+                            "t": list(segment.get("t", [])),
+                            "v": [
+                                float(value) / float(scale0)
+                                for value in segment.get("v", [])
+                            ],
+                        }
+                    )
+
+                params[f"{leaf_path}.normalized_segment_samples"] = _literal(
+                    normalized_segments
+                )
+                params[f"{leaf_path}.default_segment_duration"] = _literal(
+                    segment_duration
+                )
+                params[f"{leaf_path}.default_adc_delay"] = _literal(
+                    default_adc_delay
+                )
+                params[f"{leaf_path}.default_adc_duration"] = _literal(
+                    default_adc_duration
+                )
+                varying_value_path = f"{leaf_path}.{attribute}"
+                self._write_single_loop_linear_value(
+                    params=params,
+                    path=varying_value_path,
+                    binding=binding,
+                    counter_path=f"{self._active_loop_path}.counter",
+                )
+                params[f"{leaf_path}.samples"] = _expr(
+                    inputs={
+                        "segments": (
+                            f"{leaf_path}.normalized_segment_samples"
+                        ),
+                        "counter": f"{readout_loop_path}.counter",
+                        "scale": varying_value_path,
+                        "window_data": f"{readout_loop_path}.window_data",
+                        "segment_duration": f"{readout_loop_path}.duration",
+                        "default_segment_duration": (
+                            f"{leaf_path}.default_segment_duration"
+                        ),
+                        "default_adc_delay": f"{leaf_path}.default_adc_delay",
+                        "default_adc_duration": (
+                            f"{leaf_path}.default_adc_duration"
+                        ),
+                    },
+                    script=(
+                        "local n = #segments\n"
+                        "local idx = ((counter or 0) % n) + 1\n"
+                        "local src = segments[idx] or segments[1]\n"
+                        "local md = window_data.metadata or {}\n"
+                        "local new_pre = window_data.event_delay "
+                        "or window_data.readout_delay or md.event_delay "
+                        "or default_adc_delay or 0\n"
+                        "local new_mid = window_data.duration "
+                        "or default_adc_duration or 0\n"
+                        "local new_total = segment_duration "
+                        "or default_segment_duration or 0\n"
+                        "local old_pre = default_adc_delay or 0\n"
+                        "local old_mid = default_adc_duration or 0\n"
+                        "local old_total = default_segment_duration or 0\n"
+                        "local old_mid_end = old_pre + old_mid\n"
+                        "local new_mid_end = new_pre + new_mid\n"
+                        "local function warp(t)\n"
+                        "  if t <= old_pre then\n"
+                        "    if old_pre > 0 then return t*new_pre/old_pre end\n"
+                        "    return t\n"
+                        "  end\n"
+                        "  if t <= old_mid_end then\n"
+                        "    if old_mid > 0 then "
+                        "return new_pre + (t-old_pre)*new_mid/old_mid end\n"
+                        "    return new_pre\n"
+                        "  end\n"
+                        "  local old_post = old_total-old_mid_end\n"
+                        "  local new_post = math.max(0, new_total-new_mid_end)\n"
+                        "  if old_post > 0 then "
+                        "return new_mid_end + (t-old_mid_end)*new_post/old_post end\n"
+                        "  return new_mid_end\n"
+                        "end\n"
+                        "local out = {t={}, v={}}\n"
+                        "for i=1,#src.v do "
+                        "out.t[i] = warp(src.t[i]); "
+                        "out.v[i] = src.v[i] * scale end\n"
+                        "return out"
+                    ),
+                )
+                params[f"{leaf_path}.seqstar_variation_attribute"] = (
+                    _literal(attribute)
+                )
+                params[f"{leaf_path}.seqstar_variation_counter"] = _literal(
+                    f"{self._active_loop_path}.counter"
+                )
+            else:
+                params[f"{leaf_path}.segment_samples"] = _literal(
+                    item["segment_table"]
+                )
+                params[f"{leaf_path}.default_segment_duration"] = _literal(
+                    segment_duration
+                )
+                params[f"{leaf_path}.default_adc_delay"] = _literal(
+                    default_adc_delay
+                )
+                params[f"{leaf_path}.default_adc_duration"] = _literal(
+                    default_adc_duration
+                )
+                params[f"{leaf_path}.samples"] = _expr(
+                    inputs={
+                        "segments": f"{leaf_path}.segment_samples",
+                        "counter": f"{readout_loop_path}.counter",
+                        "window_data": f"{readout_loop_path}.window_data",
+                        "segment_duration": f"{readout_loop_path}.duration",
+                        "default_segment_duration": (
+                            f"{leaf_path}.default_segment_duration"
+                        ),
+                        "default_adc_delay": f"{leaf_path}.default_adc_delay",
+                        "default_adc_duration": (
+                            f"{leaf_path}.default_adc_duration"
+                        ),
+                    },
+                    script=(
+                        "local n = #segments\n"
+                        "local idx = ((counter or 0) % n) + 1\n"
+                        "local src = segments[idx] or segments[1]\n"
+                        "local md = window_data.metadata or {}\n"
+                        "local new_pre = window_data.event_delay "
+                        "or window_data.readout_delay or md.event_delay "
+                        "or default_adc_delay or 0\n"
+                        "local new_mid = window_data.duration "
+                        "or default_adc_duration or 0\n"
+                        "local new_total = segment_duration "
+                        "or default_segment_duration or 0\n"
+                        "local old_pre = default_adc_delay or 0\n"
+                        "local old_mid = default_adc_duration or 0\n"
+                        "local old_total = default_segment_duration or 0\n"
+                        "local old_mid_end = old_pre + old_mid\n"
+                        "local new_mid_end = new_pre + new_mid\n"
+                        "local function warp(t)\n"
+                        "  if t <= old_pre then\n"
+                        "    if old_pre > 0 then return t*new_pre/old_pre end\n"
+                        "    return t\n"
+                        "  end\n"
+                        "  if t <= old_mid_end then\n"
+                        "    if old_mid > 0 then "
+                        "return new_pre + (t-old_pre)*new_mid/old_mid end\n"
+                        "    return new_pre\n"
+                        "  end\n"
+                        "  local old_post = old_total-old_mid_end\n"
+                        "  local new_post = math.max(0, new_total-new_mid_end)\n"
+                        "  if old_post > 0 then "
+                        "return new_mid_end + (t-old_mid_end)*new_post/old_post end\n"
+                        "  return new_mid_end\n"
+                        "end\n"
+                        "local out = {t={}, v=src.v}\n"
+                        "for i=1,#src.t do out.t[i] = warp(src.t[i]) end\n"
+                        "return out"
+                    ),
+                )
 
             basic_repr_name = f"basic_repr_grad_{index}"
             basic_tstart_name = (
@@ -1884,6 +3457,108 @@ class GenericGammaStarDocumentBuilder:
             script="return warning_count == 0",
         )
 
+    def _flatten_protocol_relationship_target(
+        self,
+        *,
+        params: dict[str, Any],
+        target_path: str,
+        max_depth: int = 8,
+    ) -> None:
+        """Inline a derived protocol relationship into an exported target.
+
+        A target such as ``root.<loop>.length`` may initially be a transparent
+        alias of ``root.prot.some_derived_value``.  Some interactive runtimes do
+        not invalidate that two-hop chain reliably.  This routine follows only
+        declared parameter references and copies the referenced expression.  It
+        does not inspect parameter names or infer sequence physics.
+        """
+
+        for _ in range(max_depth):
+            current = params.get(target_path)
+            if not isinstance(current, Mapping):
+                return
+            inputs = current.get("inputs")
+            script = str(current.get("script") or "").strip()
+            if not isinstance(inputs, Mapping) or len(inputs) != 1:
+                return
+            source_path = next(iter(inputs.values()))
+            if not isinstance(source_path, str) or not source_path.startswith(
+                "root.prot."
+            ):
+                return
+            # Only flatten a transparent alias.
+            if script not in {"return count", "return value", "return length", "return duration"}:
+                return
+            source = params.get(source_path)
+            if not isinstance(source, Mapping):
+                return
+            source_inputs = source.get("inputs")
+            if not isinstance(source_inputs, Mapping) or not source_inputs:
+                return
+            params[target_path] = {
+                "inputs": dict(source_inputs),
+                "script": str(source.get("script") or "return 1"),
+            }
+
+    def _rebind_outer_loop_length_to_protocol_expression(
+        self,
+        *,
+        params: dict[str, Any],
+        loop_path: str,
+        repeat_count_ref: Any,
+        repetitions: int,
+    ) -> None:
+        """Bind a loop directly to its declared protocol relationship.
+
+        ``repeat_count`` may be supplied as a string, a ``ParameterRef`` or a
+        compound expression.  The resolver needs the expression object, while
+        gammaSTAR benefits from a direct dependency on the primitive protocol
+        leaves.  This method therefore identifies the matching protocol source
+        and copies its exported relationship onto ``<loop>.length``.
+
+        The implementation is sequence-agnostic: it does not inspect EPI,
+        ``n_y`` or ETL.  It only follows the relationship declared by the node.
+        """
+
+        length_path = f"{loop_path}.length"
+        source_name = _protocol_source_name_from_value(
+            repeat_count_ref,
+            self._live_protocol_values,
+        )
+
+        if source_name is None:
+            params.setdefault(length_path, _literal(int(repetitions)))
+            return
+
+        protocol_path = f"root.prot.{_protocol_key(source_name)}"
+        protocol_parameter = params.get(protocol_path)
+
+        if not isinstance(protocol_parameter, Mapping):
+            params[length_path] = _expr(
+                inputs={"count": protocol_path},
+                script="return count",
+            )
+            return
+
+        inputs = protocol_parameter.get("inputs")
+        script = protocol_parameter.get("script")
+
+        if isinstance(inputs, Mapping) and inputs:
+            params[length_path] = {
+                "inputs": dict(inputs),
+                "script": str(script or "return 1"),
+            }
+        else:
+            params[length_path] = _expr(
+                inputs={"count": protocol_path},
+                script="return count",
+            )
+
+        params["root.info.seqstar_motif_repetitions"] = _expr(
+            inputs={"count": length_path},
+            script="return count",
+        )
+
     def _add_root_loop_and_kernel(
         self,
         *,
@@ -1891,27 +3566,43 @@ class GenericGammaStarDocumentBuilder:
         loop_path: str,
         kernel_path: str,
         repetitions: int,
+        repeat_count_ref: Any = None,
         tr: float,
         block_duration: float,
     ) -> None:
-        """Add root, average loop, and kernel timing."""
+        """Add root-loop/kernel timing while preserving symbolic loop length."""
 
         params["root.tstart"] = _literal(0.0)
         params[f"{loop_path}.counter"] = _literal(0)
-        loop_protocol_key = loop_path.rsplit(".", 1)[-1]
-        if loop_protocol_key in self._live_protocol_values:
+
+        # Prefer the exact repeat_count supplied to seq.set_node(...). This is
+        # the authoritative relationship and avoids reconstructing semantics
+        # from a loop token such as ``segment`` or ``ky``.
+        loop_length_source = _protocol_source_name_from_value(
+            repeat_count_ref,
+            self._live_protocol_values,
+        )
+        if loop_length_source is None:
+            loop_length_source = self._loop_length_protocol_source(
+                loop_path=loop_path,
+            )
+
+        if loop_length_source is not None:
             params[f"{loop_path}.length"] = _expr(
-                inputs={"count": f"root.prot.{loop_protocol_key}"},
+                inputs={
+                    "count": f"root.prot.{_protocol_key(loop_length_source)}"
+                },
                 script="return count",
             )
         else:
-            params[f"{loop_path}.length"] = _literal(repetitions)
+            params[f"{loop_path}.length"] = _literal(int(repetitions))
+
         params[f"{loop_path}.tstart"] = _expr(
             inputs={
-                "average_counter": f"{loop_path}.counter",
-                "TR": "root.prot.TR",
+                "counter": f"{loop_path}.counter",
+                "period": "root.prot.TR",
             },
-            script="return average_counter * TR",
+            script="return counter * period",
         )
 
         params[f"{kernel_path}.tstart"] = _literal(0.0)
@@ -2207,7 +3898,14 @@ class GenericGammaStarDocumentBuilder:
         variant_table = _gradient_variant_table(gradient_event)
 
         params[f"{grad_path}.tstart"] = _literal(0.0)
-        params[f"{grad_path}.direction"] = _literal(grad_data["direction"])
+        params[f"{grad_path}.logical_axis"] = _literal(
+            _gradient_logical_axis_for_orientation(gradient_event)
+        )
+        params[f"{grad_path}.direction_fallback"] = _literal(grad_data["direction"])
+        params[f"{grad_path}.direction"] = self._gradient_direction_parameter(
+            gradient_event=gradient_event,
+            fallback_direction=grad_data["direction"],
+        )
         params[f"{grad_path}.channel"] = _literal(grad_data.get("channel"))
         params[f"{grad_path}.kind"] = _literal(grad_data.get("kind"))
         params[f"{grad_path}.role"] = _literal(grad_data.get("role"))
@@ -2500,7 +4198,43 @@ class GenericGammaStarDocumentBuilder:
         # SingleReadout blueprint span this duration, because gammaSTAR plots
         # SingleReadout as an active readout/ADC object.
         params[f"{readout_loop_path}.windows"] = _literal(windows)
-        params[f"{readout_loop_path}.num_windows"] = _literal(len(windows))
+
+        # Prefer live protocol controls for a regular ADC train. This keeps the
+        # inner readout loop responsive to protocol edits such as ETL and
+        # readout duration. The fallback remains the concrete exported table.
+        live_etl_path = None
+        for key in ("echo_train_length", "etl", "turbo_factor"):
+            candidate = f"root.prot.{_protocol_key(key)}"
+            if candidate in params or key in self._live_protocol_values:
+                live_etl_path = candidate
+                break
+
+        live_readout_duration_path = None
+        for key in ("readout_duration", "adc_duration"):
+            candidate = f"root.prot.{_protocol_key(key)}"
+            if candidate in params or key in self._live_protocol_values:
+                live_readout_duration_path = candidate
+                break
+
+        live_echo_spacing_path = None
+        for key in ("echo_spacing", "readout_spacing"):
+            candidate = f"root.prot.{_protocol_key(key)}"
+            if candidate in params or key in self._live_protocol_values:
+                live_echo_spacing_path = candidate
+                break
+
+        live_samples_path = None
+        for key in ("adc_samples", "n_x", "num_samples"):
+            candidate = f"root.prot.{_protocol_key(key)}"
+            if candidate in params or key in self._live_protocol_values:
+                live_samples_path = candidate
+                break
+
+        params[f"{readout_loop_path}.num_windows"] = (
+            _expr(inputs={"count": live_etl_path}, script="return count")
+            if live_etl_path is not None
+            else _literal(len(windows))
+        )
         params[f"{readout_loop_path}.train_duration"] = _literal(duration)
         params[f"{readout_loop_path}.mode"] = _literal(str(adc_data.get("mode", "windows")))
         params[f"{readout_loop_path}.trajectory"] = _literal(adc_data.get("trajectory"))
@@ -2532,52 +4266,202 @@ class GenericGammaStarDocumentBuilder:
             script="return num_windows",
         )
 
-        params[f"{readout_loop_path}.window_data"] = _expr(
+        first_window = windows[0]
+        first_metadata = _adc_window_value(first_window, "metadata", {})
+        if not isinstance(first_metadata, Mapping):
+            first_metadata = {}
+        first_tstart = float(
+            _adc_window_value(
+                first_window,
+                "tstart",
+                _adc_window_value(first_window, "delay", 0.0),
+            )
+        )
+        first_event_delay = float(
+            _adc_window_value(
+                first_window,
+                "event_delay",
+                _adc_window_value(
+                    first_window,
+                    "readout_delay",
+                    first_metadata.get("event_delay", 0.0),
+                ),
+            )
+        )
+        first_duration = float(
+            _adc_window_value(first_window, "duration", 0.0)
+        )
+        first_samples = int(
+            _adc_window_value(
+                first_window,
+                "num_samples",
+                _adc_window_value(first_window, "number_of_samples", 1),
+            )
+        )
+        first_sample_time = float(
+            _adc_window_value(
+                first_window,
+                "sample_time",
+                _adc_window_value(
+                    first_window,
+                    "dwell",
+                    first_duration / max(first_samples, 1),
+                ),
+            )
+        )
+
+        if (
+            live_readout_duration_path is not None
+            and live_echo_spacing_path is not None
+            and live_samples_path is not None
+        ):
+            params[f"{readout_loop_path}.window_data"] = _expr(
+                inputs={
+                    "counter": f"{readout_loop_path}.counter",
+                    "readout_duration": live_readout_duration_path,
+                    "echo_spacing": f"{readout_loop_path}.duration",
+                    "num_samples": live_samples_path,
+                    "first_tstart": f"{readout_loop_path}.first_tstart",
+                    "event_delay": f"{readout_loop_path}.event_delay",
+                },
+                script=(
+                    "local duration = readout_duration or 0\n"
+                    "local samples = num_samples or 1\n"
+                    "return {tstart=first_tstart + counter*echo_spacing, "
+                    "delay=first_tstart + counter*echo_spacing, "
+                    "duration=duration, num_samples=samples, "
+                    "number_of_samples=samples, sample_time=duration/samples, "
+                    "dwell=duration/samples, event_delay=event_delay, "
+                    "metadata={event_delay=event_delay}}"
+                ),
+            )
+            params[f"{readout_loop_path}.first_tstart"] = _literal(first_tstart)
+            params[f"{readout_loop_path}.event_delay"] = _literal(first_event_delay)
+        else:
+            params[f"{readout_loop_path}.window_data"] = _expr(
+                inputs={
+                    "windows": f"{readout_loop_path}.windows",
+                    "counter": f"{readout_loop_path}.counter",
+                },
+                script=(
+                    "local idx = counter + 1\n"
+                    "return windows[idx] or windows[#windows]\n"
+                ),
+            )
+
+        # The repeated synchronized interval spans one complete gradient
+        # segment, not only the ADC gate. Prefer a declared live segment period
+        # (for example a protocol echo/readout spacing); otherwise retain the
+        # concrete spacing inferred from the exported window table.
+        params[f"{readout_loop_path}.default_iteration_duration"] = _literal(
+            (
+                float(
+                    _adc_window_value(
+                        windows[1],
+                        "tstart",
+                        _adc_window_value(windows[1], "delay", 0.0),
+                    )
+                )
+                - float(
+                    _adc_window_value(
+                        windows[0],
+                        "tstart",
+                        _adc_window_value(windows[0], "delay", 0.0),
+                    )
+                )
+            )
+            if len(windows) > 1
+            else first_event_delay + first_duration
+        )
+        if live_echo_spacing_path is not None:
+            params[f"{readout_loop_path}.duration"] = _expr(
+                inputs={"duration": live_echo_spacing_path},
+                script="return duration",
+            )
+            # Inline a declared derived spacing relationship into the actual
+            # repeated interval.  This is generic relationship lowering: the
+            # writer does not inspect parameter names or sequence type.
+            self._flatten_protocol_relationship_target(
+                params=params,
+                target_path=f"{readout_loop_path}.duration",
+            )
+        else:
+            params[f"{readout_loop_path}.duration"] = _expr(
+                inputs={
+                    "duration": (
+                        f"{readout_loop_path}.default_iteration_duration"
+                    )
+                },
+                script="return duration",
+            )
+
+        # Keep the full train duration live when either the repeated interval
+        # or loop length changes.
+        params[f"{readout_loop_path}.train_duration"] = _expr(
             inputs={
-                "windows": f"{readout_loop_path}.windows",
-                "counter": f"{readout_loop_path}.counter",
+                "count": f"{readout_loop_path}.length",
+                "iteration": f"{readout_loop_path}.duration",
             },
+            script="return count * iteration",
+        )
+        # For a multi-window ADC train, ``window_data.tstart`` is the ADC gate
+        # start, not the start of the synchronized readout gradient segment.
+        # The SingleReadout loop must begin at the gradient-segment start, and
+        # the ADC child must carry the intra-segment delay. Otherwise gammaSTAR
+        # plots the ADC gate from the beginning of the ramp and EPI-03 fails.
+        params[f"{readout_loop_path}.tstart"] = _expr(
+            inputs={"window_data": f"{readout_loop_path}.window_data"},
             script=(
-                "local idx = counter + 1\n"
-                "return windows[idx]\n"
+                "local wstart = window_data.tstart or window_data.delay or 0\n"
+                "local md = window_data.metadata or {}\n"
+                "local event_delay = window_data.event_delay "
+                "or window_data.readout_delay or md.event_delay or 0\n"
+                "return wstart - event_delay\n"
             ),
         )
 
-        # Loop duration is the duration of the current iteration, not the
-        # complete train span. The full span remains available separately as
-        # ``train_duration``.
-        params[f"{readout_loop_path}.duration"] = _expr(
-            inputs={
-                "window_data": f"{readout_loop_path}.window_data",
-            },
-            script="return window_data.duration or 0",
-        )
-        tstart_parameter = self._event_tstart_parameter(
-            target_event=adc_event,
-            target_container_path=readout_loop_path,
-            target_duration_path=f"{single_readout_path}.duration",
-            fallback_tstart=None,
-            local_tstart_expr=f"{readout_loop_path}.window_data",
-        )
-
-        if _is_literal_or_window_absolute_parameter(tstart_parameter):
-            forced_tstart = self._force_adc_protocol_relative_tstart_parameter(
-                target_event=adc_event,
-                fallback_tstart=None,
-                local_tstart_expr=f"{readout_loop_path}.window_data",
-            )
-            if forced_tstart is not None:
-                tstart_parameter = forced_tstart
-
-        params[f"{readout_loop_path}.tstart"] = tstart_parameter
-
-        # Match the reference EPI line-loop pattern: the loop positions each
-        # readout in time, while the SingleReadout child starts at zero within
-        # each loop iteration and has only one ADC-window duration.
+        # The SingleReadout container spans the complete synchronized
+        # gradient/ADC interval. The ADC child retains its own intra-segment
+        # delay and gate duration.
         params[f"{single_readout_path}.tstart"] = _literal(0.0)
         params[f"{single_readout_path}.duration"] = _expr(
+            inputs={"duration": f"{readout_loop_path}.duration"},
+            script="return duration",
+        )
+        # Generic synchronized-window timing diagnostics. These expose the
+        # remaining non-ADC interval and make invalid protocol edits visible
+        # without assuming a particular sequence type.
+        params[f"{readout_loop_path}.timing_margin"] = _expr(
+            inputs={
+                "iteration": f"{readout_loop_path}.duration",
+                "window_data": f"{readout_loop_path}.window_data",
+            },
+            script=(
+                "local md = window_data.metadata or {}\n"
+                "local delay = window_data.event_delay "
+                "or window_data.readout_delay or md.event_delay or 0\n"
+                "local gate = window_data.duration or 0\n"
+                "return iteration - delay - gate"
+            ),
+        )
+        params[f"{readout_loop_path}.timing_valid"] = _expr(
+            inputs={"margin": f"{readout_loop_path}.timing_margin"},
+            script="return margin >= -1e-12",
+        )
+        params[f"{readout_loop_path}.adc_flat_start"] = _expr(
             inputs={"window_data": f"{readout_loop_path}.window_data"},
-            script="return window_data.duration or 0",
+            script=(
+                "local md = window_data.metadata or {}\n"
+                "return window_data.event_delay "
+                "or window_data.readout_delay or md.event_delay or 0"
+            ),
+        )
+        params[f"{readout_loop_path}.adc_flat_end"] = _expr(
+            inputs={
+                "start": f"{readout_loop_path}.adc_flat_start",
+                "window_data": f"{readout_loop_path}.window_data",
+            },
+            script="return start + (window_data.duration or 0)",
         )
         params[f"{single_readout_path}.tcenter"] = _expr(
             inputs={
@@ -2716,14 +4600,21 @@ class GenericGammaStarDocumentBuilder:
             script=f"return {_safe_input_name(adc_path)}_enabled_single",
         )
 
-        params[f"{adc_path}.tstart"] = _literal(0.0)
-
         if window_expr is None:
+            params[f"{adc_path}.tstart"] = _literal(0.0)
             params[f"{adc_path}.duration"] = _literal(first_duration)
             params[f"{adc_path}.number_of_samples"] = _literal(first_samples)
             params[f"{adc_path}.sample_time"] = _literal(first_sample_time)
             params[f"{adc_path}.window_data"] = _literal(first_window)
         else:
+            params[f"{adc_path}.tstart"] = _expr(
+                inputs={"window_data": window_expr},
+                script=(
+                    "local md = window_data.metadata or {}\n"
+                    "return window_data.event_delay "
+                    "or window_data.readout_delay or md.event_delay or 0\n"
+                ),
+            )
             params[f"{adc_path}.duration"] = _expr(
                 inputs={"window_data": window_expr},
                 script="return window_data.duration or 0",
@@ -2759,7 +4650,12 @@ class GenericGammaStarDocumentBuilder:
         params[f"{adc_path}.phase"] = _literal(phase)
         params[f"{adc_path}.frequency"] = _literal(frequency)
         params[f"{adc_path}.mode"] = _literal(str(adc_data.get("mode", "single")))
-        params[f"{adc_path}.trajectory"] = _literal(adc_data.get("trajectory"))
+        # gammaSTAR's serializer expects a concrete value. An empty table is
+        # the appropriate representation for acquisitions with no k-space
+        # trajectory, rather than a Lua nil that disappears during table export.
+        params[f"{adc_path}.trajectory"] = _literal(
+            adc_data.get("trajectory") if adc_data.get("trajectory") is not None else {}
+        )
         params[f"{adc_path}.sample_time_us"] = _expr(
             inputs={"sample_time": f"{adc_path}.sample_time"},
             script="return sample_time * 1e6",
@@ -2773,6 +4669,13 @@ class GenericGammaStarDocumentBuilder:
                 "idx_kspace_encode_step_1": f"{header_path}.idx_kspace_encode_step_1",
                 "idx_kspace_encode_step_2": f"{header_path}.idx_kspace_encode_step_2",
                 "idx_slice": f"{header_path}.idx_slice",
+                "read_dir": f"{header_path}.read_dir",
+                "phase_dir": f"{header_path}.phase_dir",
+                "slice_dir": f"{header_path}.slice_dir",
+                "position": f"{header_path}.position",
+                "offcenter": f"{header_path}.offcenter",
+                "matrix_size": f"{header_path}.matrix_size",
+                "field_of_view": f"{header_path}.field_of_view",
             },
             script=(
                 "return {\n"
@@ -2781,7 +4684,14 @@ class GenericGammaStarDocumentBuilder:
                 "center_sample=center_sample,\n"
                 "idx_kspace_encode_step_1=idx_kspace_encode_step_1,\n"
                 "idx_kspace_encode_step_2=idx_kspace_encode_step_2,\n"
-                "idx_slice=idx_slice\n"
+                "idx_slice=idx_slice,\n"
+                "read_dir=read_dir,\n"
+                "phase_dir=phase_dir,\n"
+                "slice_dir=slice_dir,\n"
+                "position=position,\n"
+                "offcenter=offcenter,\n"
+                "matrix_size=matrix_size,\n"
+                "field_of_view=field_of_view\n"
                 "}"
             ),
         )
@@ -2795,59 +4705,114 @@ class GenericGammaStarDocumentBuilder:
             script="return sample_time_us",
         )
 
-        if window_expr is None:
-            center_sample = first_window.get("center_sample")
-            if center_sample is None:
-                center_sample = math.floor(0.5 * (first_samples - 1))
+        # Header values are intentionally live relationships. They are the
+        # bridge from editable protocol controls and loop counters to scanner
+        # acquisition metadata. This keeps GRE simple while giving EPI a stable
+        # place to add echo, segment, and polarity metadata later.
+        params[f"{header_path}.center_sample"] = _expr(
+            inputs={"number_of_samples": f"{adc_path}.number_of_samples"},
+            script="return math.floor(0.5 * (number_of_samples - 1))",
+        )
 
-            params[f"{header_path}.center_sample"] = _literal(center_sample)
-            adc_variants = _event_repetition_variants(adc_event)
-            if len(adc_variants) > 1:
-                counter_path = _event_loop_counter_path(adc_event, default=self._active_loop_path + ".counter")
+        phase_counter_path = self._phase_encode_counter_path(
+            params=params,
+            adc_event=adc_event,
+        )
+
+        if window_expr is None:
+            window_line_index = int(first_window.get("line_index") or 0)
+            if phase_counter_path is not None:
                 params[f"{header_path}.idx_kspace_encode_step_1"] = _expr(
-                    inputs={"counter": counter_path},
+                    inputs={"counter": phase_counter_path},
                     script="return counter or 0",
                 )
             else:
                 params[f"{header_path}.idx_kspace_encode_step_1"] = _literal(
-                    int(first_window.get("line_index") or 0)
+                    window_line_index
                 )
             params[f"{header_path}.idx_kspace_encode_step_2"] = _literal(
                 int(first_window.get("partition_index") or 0)
             )
-            params[f"{header_path}.idx_slice"] = _literal(
-                int(first_window.get("slice_index") or 0)
+            params[f"{header_path}.idx_slice"] = self._slice_index_parameter(
+                default=int(first_window.get("slice_index") or 0)
             )
         else:
-            params[f"{header_path}.center_sample"] = _expr(
-                inputs={
-                    "window_data": window_expr,
-                    "number_of_samples": f"{adc_path}.number_of_samples",
-                },
-                script=(
-                    "if window_data.center_sample ~= nil then\n"
-                    "  return window_data.center_sample\n"
-                    "end\n"
-                    "return math.floor(0.5 * (number_of_samples - 1))"
-                ),
-            )
-            params[f"{header_path}.idx_kspace_encode_step_1"] = _expr(
-                inputs={"window_data": window_expr},
-                script="return window_data.line_index or window_data.phase_encode_index or 0",
-            )
+            if phase_counter_path is not None:
+                params[f"{header_path}.idx_kspace_encode_step_1"] = _expr(
+                    inputs={
+                        "window_data": window_expr,
+                        "counter": phase_counter_path,
+                    },
+                    script=(
+                        "if window_data.line_index ~= nil then\n"
+                        "  return window_data.line_index\n"
+                        "end\n"
+                        "if window_data.phase_encode_index ~= nil then\n"
+                        "  return window_data.phase_encode_index\n"
+                        "end\n"
+                        "return counter or 0"
+                    ),
+                )
+            else:
+                params[f"{header_path}.idx_kspace_encode_step_1"] = _expr(
+                    inputs={"window_data": window_expr},
+                    script=(
+                        "return window_data.line_index "
+                        "or window_data.phase_encode_index or 0"
+                    ),
+                )
             params[f"{header_path}.idx_kspace_encode_step_2"] = _expr(
                 inputs={"window_data": window_expr},
                 script="return window_data.partition_index or 0",
             )
             params[f"{header_path}.idx_slice"] = _expr(
-                inputs={"window_data": window_expr},
-                script="return window_data.slice_index or 0",
+                inputs={
+                    "window_data": window_expr,
+                    "slice_default": self._slice_index_default_path(params),
+                },
+                script=(
+                    "if window_data.slice_index ~= nil then\n"
+                    "  return window_data.slice_index\n"
+                    "end\n"
+                    "return slice_default or 0"
+                ),
             )
 
-        params[f"{header_path}.read_dir"] = _literal([1.0, 0.0, 0.0])
-        params[f"{header_path}.phase_dir"] = _literal([0.0, 1.0, 0.0])
-        params[f"{header_path}.slice_dir"] = _literal([0.0, 0.0, 1.0])
-        params[f"{header_path}.position"] = _literal([0.0, 0.0, 0.0])
+        params[f"{header_path}.read_dir"] = _expr(
+            inputs={"read_dir": "root.info.encoding_read_dir"},
+            script="return read_dir",
+        )
+        params[f"{header_path}.phase_dir"] = _expr(
+            inputs={"phase_dir": "root.info.encoding_phase_dir"},
+            script="return phase_dir",
+        )
+        params[f"{header_path}.slice_dir"] = _expr(
+            inputs={"slice_dir": "root.info.encoding_slice_dir"},
+            script="return slice_dir",
+        )
+        params[f"{header_path}.position"] = _expr(
+            inputs={"position": "root.info.encoding_position"},
+            script="return position",
+        )
+        # gammaSTAR's ADC Header blueprint expects an `offcenter` parameter.
+        # SeqStar stores the same semantic quantity as the acquisition
+        # position/encoding position. Export both names so the backend header
+        # is complete while keeping the public geometry model unchanged.
+        params[f"{header_path}.offcenter"] = _expr(
+            inputs={"position": f"{header_path}.position"},
+            script="return position",
+        )
+        # Reuse the same global geometry objects consumed by gammaSTAR's
+        # exporter. This prevents an ADC header from drifting away from
+        # root.mat_size/root.acq_size or from referencing absent protocol leaves.
+        params[f"{header_path}.matrix_size"] = _expr(
+            inputs={"mat_size": "root.mat_size"},
+            script="return {mat_size[1], mat_size[2], mat_size[3]}",
+        )
+        params[f"{header_path}.field_of_view"] = _expr(
+            inputs={"fov": "root.fov"},
+            script="return {fov[1], fov[2], fov[3]}",
+        )
 
         params[f"{adc_path}.is_duration_nonnegative_and_rastered_and_samples_pos"] = _expr(
             inputs={
@@ -2879,6 +4844,218 @@ class GenericGammaStarDocumentBuilder:
             ),
         )
 
+
+    def _loop_length_protocol_source(
+        self,
+        *,
+        loop_path: str,
+    ) -> str | None:
+        """Return the protocol key that should drive a gammaSTAR Loop length.
+
+        The visible loop token can be semantic, e.g. ``root.ky`` from a
+        ``ky_index`` counter, while the matrix-size protocol key is ``n_y``.
+        This helper keeps the loop length live by recovering that source from
+        the symbolic node registry when possible, and by applying conservative
+        k-space token aliases as a fallback.
+        """
+
+        loop_token = _safe_path_token(loop_path.rsplit(".", 1)[-1])
+
+        # Direct protocol match, e.g. root.average.length <- root.prot.average.
+        direct = _protocol_key(loop_token)
+        if direct in self._live_protocol_values:
+            return direct
+
+        # Matrix/encoding loop aliases. These are semantic protocol dimensions,
+        # not sequence names.
+        alias_candidates = {
+            "ky": ("n_y", "ny", "phase_encode_steps"),
+            "phase": ("n_y", "ny", "phase_encode_steps"),
+            "pe": ("n_y", "ny", "phase_encode_steps"),
+            "kx": ("n_x", "nx", "readout_points"),
+            "read": ("n_x", "nx", "readout_points"),
+            "kz": ("n_z", "nz", "partitions"),
+            "partition": ("n_z", "nz", "partitions"),
+            "slice": ("n_slices", "num_slices", "slices"),
+        }.get(loop_token, ())
+
+        for candidate in alias_candidates:
+            key = _protocol_key(candidate)
+            if key in self._live_protocol_values:
+                return key
+
+        # Recover source from the symbolic sequence, since the realization view
+        # may already have resolved repeat_count/factor to a number.
+        source = self._loop_length_source_from_symbolic_nodes(
+            loop_token=loop_token,
+        )
+        if source is not None:
+            return source
+
+        return None
+
+    def _loop_length_source_from_symbolic_nodes(
+        self,
+        *,
+        loop_token: str,
+    ) -> str | None:
+        """Inspect symbolic set_node metadata for repeat_count/factor source."""
+
+        registry = _sequence_node_registry_for_export(self.symbolic_sequence)
+
+        for _node_name, record in registry.items():
+            if not isinstance(record, Mapping):
+                continue
+
+            record_token = _repeat_loop_token_for_export(
+                record.get("repeat_count"),
+                record.get("counter"),
+            )
+            record_name_token = _safe_path_token(
+                str(
+                    record.get("name")
+                    or record.get("node")
+                    or _node_name
+                ).rsplit(".", 1)[-1]
+            )
+            # The emitted gammaSTAR loop path is derived from the logical node
+            # name (for example, root.kernel), whereas the semantic loop token
+            # may come from its counter (for example, ky_index -> ky). Match
+            # either identity before recovering the symbolic repeat-count
+            # source. Otherwise factor=p.n_y may be exported as a fixed literal.
+            if (
+                _safe_path_token(record_token) != loop_token
+                and record_name_token != loop_token
+            ):
+                continue
+
+            source = _protocol_source_name_from_value(
+                record.get("repeat_count"),
+                self._live_protocol_values,
+            )
+            if source is not None:
+                return source
+
+            # Some timeline implementations keep the original expression under
+            # a metadata/source key after resolving repeat_count numerically.
+            metadata = record.get("metadata")
+            if isinstance(metadata, Mapping):
+                for key in (
+                    "repeat_count_source",
+                    "factor_source",
+                    "loop_length_source",
+                    "protocol_source",
+                ):
+                    source = _protocol_source_name_from_value(
+                        metadata.get(key),
+                        self._live_protocol_values,
+                    )
+                    if source is not None:
+                        return source
+
+            for key in (
+                "factor",
+                "factor_source",
+                "repeat_count_source",
+                "loop_length_source",
+            ):
+                source = _protocol_source_name_from_value(
+                    record.get(key),
+                    self._live_protocol_values,
+                )
+                if source is not None:
+                    return source
+
+        return None
+
+    def _gradient_direction_parameter(
+        self,
+        *,
+        gradient_event: Any,
+        fallback_direction: Any,
+    ) -> dict[str, Any]:
+        """Return live gammaSTAR direction expression for a logical gradient."""
+
+        logical_axis = _gradient_logical_axis_for_orientation(gradient_event)
+        if logical_axis == "read":
+            return _expr(
+                inputs={"direction": "root.info.encoding_read_dir"},
+                script="return direction",
+            )
+        if logical_axis == "phase":
+            return _expr(
+                inputs={"direction": "root.info.encoding_phase_dir"},
+                script="return direction",
+            )
+        if logical_axis == "slice":
+            return _expr(
+                inputs={"direction": "root.info.encoding_slice_dir"},
+                script="return direction",
+            )
+        return _literal(fallback_direction)
+
+    def _phase_encode_counter_path(
+        self,
+        *,
+        params: Mapping[str, Any],
+        adc_event: Any,
+    ) -> str | None:
+        """Return the loop counter that should drive k-space line index.
+
+        The outer active loop is the semantic phase-encode loop for compact GRE
+        style exports (root.ky.counter).  We prefer explicit event metadata when
+        it exists, then fall back to the active loop unless it is the generic
+        root.average loop.
+        """
+
+        metadata = getattr(adc_event, "metadata", None)
+        if isinstance(metadata, Mapping):
+            for key in (
+                "phase_encode_counter_path",
+                "line_counter_path",
+                "kspace_encode_step_1_counter_path",
+            ):
+                value = metadata.get(key)
+                if isinstance(value, str) and value in params:
+                    return value
+
+        counter_path = _event_loop_counter_path(
+            adc_event,
+            default=f"{self._active_loop_path}.counter",
+        )
+        if isinstance(counter_path, str) and counter_path in params:
+            # Do not use a generic averaging loop as a phase-encode line index.
+            if counter_path.endswith(".counter") and ".average." not in counter_path:
+                return counter_path
+            if counter_path != "root.average.counter":
+                return counter_path
+
+        active_counter = f"{self._active_loop_path}.counter"
+        if (
+            self._active_loop_path != "root.average"
+            and active_counter in params
+        ):
+            return active_counter
+
+        return None
+
+    def _slice_index_default_path(self, params: dict[str, Any]) -> str:
+        """Ensure a scalar default slice-index parameter exists."""
+
+        path = "root.info.default_slice_index"
+        params.setdefault(path, self._slice_index_parameter(default=0))
+        return path
+
+    def _slice_index_parameter(self, *, default: int = 0) -> dict[str, Any]:
+        """Return a live slice-index parameter when the protocol declares one."""
+
+        for key in ("slice_index", "idx_slice", "slice"):
+            if key in self._live_protocol_values:
+                return _expr(
+                    inputs={"slice_index": f"root.prot.{_protocol_key(key)}"},
+                    script="return slice_index or 0",
+                )
+        return _literal(int(default))
 
     def _event_container_path_for_endpoint(self, endpoint: Any) -> str | None:
         """Return the exported gammaSTAR container path for an event endpoint.
@@ -3272,6 +5449,98 @@ class GenericGammaStarDocumentBuilder:
 
         return _normalize_adc_data(_fallback_single_adc_data(adc_event), adc_event=adc_event)
 
+    def _rebuild_tests_after_final_hierarchy(
+        self,
+        *,
+        params: dict[str, Any],
+    ) -> None:
+        """Rebuild root.tests.all_tests after all hierarchy rewrites.
+
+        The writer creates RF/ADC/gradient test parameters before block
+        grouping and nested-loop rewrites. Those rewrites correctly retarget
+        parameter paths and inputs, but the Lua table inside
+        ``root.tests.all_tests`` can still contain stale display keys and nil
+        descriptions. This final pass scans the finished parameter graph and
+        rebuilds the aggregate test table from the actual final test paths.
+        """
+
+        tests: list[tuple[str, str, str]] = []
+
+        for path in sorted(params, key=_hierarchy_sort_key):
+            if path == "root.tests.all_tests":
+                continue
+            if path.endswith(
+                ".is_timing_increasing_and_rastered_and_same_am_length"
+            ):
+                tests.append(
+                    (
+                        path,
+                        _test_display_key(path),
+                        "RF sample times are strictly increasing, raster-aligned, and match RF amplitude-vector length.",
+                    )
+                )
+            elif path.endswith(
+                ".is_adc_windows_timing_increasing_and_valid"
+            ):
+                tests.append(
+                    (
+                        path,
+                        _test_display_key(path),
+                        "ADC acquisition window has positive duration, positive sample count, positive dwell time, and raster-aligned duration.",
+                    )
+                )
+            elif path.endswith(".is_timing_increasing_and_rastered"):
+                tests.append(
+                    (
+                        path,
+                        _test_display_key(path),
+                        "Gradient sample times are non-negative, strictly increasing, and gradient-raster aligned.",
+                    )
+                )
+
+        stale_test = "root.tests.seqstar_no_stale_literal_tstarts"
+        if stale_test in params:
+            tests.append(
+                (
+                    stale_test,
+                    _test_display_key(stale_test),
+                    "No downstream block or event tstart remains a stale literal after live timing dependencies are introduced.",
+                )
+            )
+
+        if not tests:
+            params["root.tests.all_tests"] = _expr(
+                inputs={},
+                script="return {}",
+            )
+            params["root.info.seqstar_test_count"] = _literal(0)
+            return
+
+        inputs: dict[str, str] = {}
+        result_lines: list[str] = ["return {"]
+        used_names: set[str] = set()
+
+        for index, (path, display_key, description) in enumerate(tests):
+            base_name = _safe_input_name(path)
+            safe_name = base_name
+            if safe_name in used_names:
+                safe_name = f"{base_name}_{index}"
+            used_names.add(safe_name)
+            inputs[safe_name] = path
+            result_lines.append(
+                f"[{_lua_string(display_key)}] = "
+                f"{{ ok = {safe_name} ~= nil and {safe_name}, "
+                f"desc = {_lua_string(description)} }},"
+            )
+
+        result_lines.append("}")
+        params["root.tests.all_tests"] = _expr(
+            inputs=inputs,
+            script="\n".join(result_lines),
+        )
+        params["root.info.seqstar_test_count"] = _literal(len(tests))
+        params["root.info.seqstar_tests_rebuilt_after_hierarchy"] = _literal(True)
+
     def _add_tests(
         self,
         *,
@@ -3298,7 +5567,7 @@ class GenericGammaStarDocumentBuilder:
             result_lines.append(
                 f'["{rf_path.removeprefix("root.")}.'
                 'is_timing_increasing_and_rastered_and_same_am_length"] = '
-                f"{{ ok = {safe_name} ~= nil and {safe_name}, desc = nil }},"
+                f"{{ ok = {safe_name} ~= nil and {safe_name}, desc = 'RF sample timing/raster validation.' }},"
             )
 
         for adc_path in adc_paths:
@@ -3308,7 +5577,7 @@ class GenericGammaStarDocumentBuilder:
             result_lines.append(
                 f'["{adc_path.removeprefix("root.")}.'
                 'is_adc_windows_timing_increasing_and_valid"] = '
-                f"{{ ok = {safe_name} ~= nil and {safe_name}, desc = nil }},"
+                f"{{ ok = {safe_name} ~= nil and {safe_name}, desc = 'ADC window timing and dwell validation.' }},"
             )
 
         for grad_path in gradient_paths:
@@ -3317,7 +5586,7 @@ class GenericGammaStarDocumentBuilder:
             inputs[safe_name] = test_name
             result_lines.append(
                 f'["{grad_path.removeprefix("root.")}.is_timing_increasing_and_rastered"] = '
-                f"{{ ok = {safe_name} ~= nil and {safe_name}, desc = nil }},"
+                f"{{ ok = {safe_name} ~= nil and {safe_name}, desc = 'Gradient sample timing/raster validation.' }},"
             )
 
         result_lines.append("}")
@@ -3339,7 +5608,19 @@ class GenericGammaStarDocumentBuilder:
     ) -> None:
         """Add protocol parameters from the enriched sequence."""
 
-        protocol_values = _collect_protocol_values(self.sequence)
+        # Use the symbolic/numeric merged protocol values prepared in to_dict().
+        # This is the key writer-boundary source of truth: numeric event geometry
+        # comes from self.sequence, while root.prot.* should preserve symbolic
+        # protocol relationships from self.symbolic_sequence whenever available.
+        protocol_values = dict(getattr(self, "_live_protocol_values", {}) or {})
+        if not protocol_values:
+            protocol_values = _canonical_protocol_values(
+                _merge_protocol_values_for_export(
+                    export_sequence=self.sequence,
+                    symbolic_sequence=self.symbolic_sequence,
+                )
+            )
+
 
         protocol_values.setdefault("TR", tr)
         protocol_values.setdefault("average", repetitions)
@@ -3378,7 +5659,39 @@ class GenericGammaStarDocumentBuilder:
                 "echo_train_length",
                 int(adc_data.get("num_windows", len(adc_data["windows"]))),
             )
-            protocol_values.setdefault("trajectory", adc_data.get("trajectory"))
+            protocol_values.setdefault(
+                "trajectory",
+                adc_data.get("trajectory")
+                if adc_data.get("trajectory") is not None
+                else {},
+            )
+
+            # Generic acquisition-geometry fallbacks. They apply to any
+            # sequence with ADC samples and incomplete spatial metadata; no
+            # sequence-family names or gradient assumptions are involved.
+            read_samples = int(
+                first_window.get(
+                    "num_samples",
+                    first_window.get("number_of_samples", 1),
+                )
+            )
+            protocol_values.setdefault("n_x", max(1, read_samples))
+            protocol_values.setdefault("n_y", 1)
+            protocol_values.setdefault("n_z", 1)
+            protocol_values.setdefault("slice_thickness", 1.0)
+            if "fov" not in protocol_values:
+                fov_read = protocol_values.get("fov_read")
+                fov_phase = protocol_values.get("fov_phase")
+                if fov_read is not None or fov_phase is not None:
+                    read_fov = fov_read if fov_read is not None else fov_phase
+                    phase_fov = fov_phase if fov_phase is not None else fov_read
+                    protocol_values["fov"] = [
+                        read_fov,
+                        phase_fov,
+                        protocol_values["slice_thickness"],
+                    ]
+                else:
+                    protocol_values["fov"] = 1.0
 
             if len(adc_data["windows"]) > 1:
                 t0 = float(
@@ -3406,19 +5719,25 @@ class GenericGammaStarDocumentBuilder:
             protocol_values.setdefault("num_gradient_events", len(gradient_events))
 
         defaults = {
+            "orientation": "axial",
             "TE": 0.0,
             "echo_spacing": 0.0,
             "echo_train_length": 1,
             "adc_samples": 0,
             "adc_delay": 0.0,
             "readout_duration": 0.0,
-            "trajectory": None,
+            "trajectory": {},
             "gradient_channel": None,
             "gradient_kind": None,
             "gradient_duration": 0.0,
             "gradient_area": 0.0,
             "gradient_max_abs_amplitude": 0.0,
             "num_gradient_events": 0,
+            "n_x": 1,
+            "n_y": 1,
+            "n_z": 1,
+            "fov": 1.0,
+            "slice_thickness": 1.0,
             "PAT_factor_phase": 1,
             "PAT_factor_slice": 1,
             "PAT_mode": "None",
@@ -3460,7 +5779,39 @@ class GenericGammaStarDocumentBuilder:
 
         for key, value in protocol_values.items():
             gamma_key = _protocol_key(key)
-            params.setdefault(f"root.prot.{gamma_key}", _literal(value))
+            target_path = f"root.prot.{gamma_key}"
+            new_param = _protocol_parameter(
+                value,
+                target_path=target_path,
+            )
+            old_param = params.get(target_path)
+            if _gammastar_debug_enabled() and gamma_key in {
+                "phase_encode_start",
+                "phase_encode_step",
+                "n_y",
+                "fov",
+                "TR",
+                "orientation",
+            }:
+                _gammastar_debug(
+                    f"_add_protocol write {target_path}: "
+                    f"old={old_param!r} new={new_param!r} "
+                    f"value={_debug_value_summary(value)}"
+                )
+
+            # Protocol controls are authoritative for root.prot.*. Earlier
+            # passes may create placeholder/default literals so dependent graph
+            # nodes can refer to the path, but the final protocol export must
+            # replace those placeholders with the merged live protocol source.
+            params[target_path] = new_param
+
+        # Avoid two independent orientation state variables in the website.
+        # Some gammaSTAR templates expose "slice_orientation"; keep it as a
+        # compatibility alias of the PyPulseq-Star orientation parameter.
+        params["root.prot.slice_orientation"] = _expr(
+            inputs={"orientation": "root.prot.orientation"},
+            script="return orientation",
+        )
 
     def _add_system(self, *, params: dict[str, Any]) -> None:
         """Add system parameters from SeqStar Opts."""
@@ -3577,14 +5928,79 @@ class GenericGammaStarDocumentBuilder:
             for event in adc_events
         )
 
+        encoding = _encoding_frame_info(self.sequence)
+
         params["root.info.description"] = _literal(description)
-        params["root.info.seq_dim"] = _literal(0)
+        # Sequence dimensionality is protocol metadata, not a property that can
+        # be inferred from the presence of spatial gradients. Gradient-free
+        # acquisitions such as spectroscopy/FID still need a valid scanner
+        # dimensionality for gammaSTAR import/export. Accept the common numeric
+        # and string forms and use 2D as the conservative compatibility default.
+        params["root.info.seq_dim"] = _expr(
+            inputs={"seq_dim": "root.prot.seq_dim"},
+            script=(
+                "if type(seq_dim) == 'number' then\n"
+                "  if seq_dim >= 3 then return 3 end\n"
+                "  return 2\n"
+                "end\n"
+                "local key = string.upper(tostring(seq_dim or '2D'))\n"
+                "if key == '3' or key == '3D' then return 3 end\n"
+                "return 2"
+            ),
+        )
         params["root.info.is_epi"] = _literal(bool(is_epi))
         params["root.info.has_rf"] = _literal(bool(rf_events))
         params["root.info.has_adc"] = _literal(bool(adc_events))
         params["root.info.has_adc_train"] = _literal(bool(has_adc_train))
         params["root.info.has_gradient"] = _literal(bool(gradient_events))
         params["root.info.num_gradient_events"] = _literal(len(gradient_events))
+        params["root.info.encoding_frame_name"] = _expr(
+            inputs={"orientation": "root.prot.orientation"},
+            script=(
+                "local key = string.lower(tostring(orientation or 'axial'))\n"
+                "if key == 'tra' or key == 'transverse' or key == 'ax' then key = 'axial' end\n"
+                "if key == 'cor' then key = 'coronal' end\n"
+                "if key == 'sag' then key = 'sagittal' end\n"
+                "return key"
+            ),
+        )
+        params["root.info.encoding_rotation"] = _expr(
+            inputs={"orientation": "root.prot.orientation"},
+            script=_orientation_lua_script("rotation"),
+        )
+        params["root.info.image_transform"] = _expr(
+            inputs={
+                "rotation": "root.info.encoding_rotation",
+                "position": "root.info.encoding_position",
+            },
+            script=(
+                "return {\n"
+                "{rotation[1][1], rotation[1][2], rotation[1][3], position[1]},\n"
+                "{rotation[2][1], rotation[2][2], rotation[2][3], position[2]},\n"
+                "{rotation[3][1], rotation[3][2], rotation[3][3], position[3]},\n"
+                "{0,0,0,1}\n"
+                "}"
+            ),
+        )
+        params["root.info.encoding_convention"] = _literal(
+            encoding["convention"]
+        )
+        params["root.info.encoding_read_dir"] = _expr(
+            inputs={"rotation": "root.info.encoding_rotation"},
+            script="return {rotation[1][1], rotation[2][1], rotation[3][1]}",
+        )
+        params["root.info.encoding_phase_dir"] = _expr(
+            inputs={"rotation": "root.info.encoding_rotation"},
+            script="return {rotation[1][2], rotation[2][2], rotation[3][2]}",
+        )
+        params["root.info.encoding_slice_dir"] = _expr(
+            inputs={"rotation": "root.info.encoding_rotation"},
+            script="return {rotation[1][3], rotation[2][3], rotation[3][3]}",
+        )
+        params["root.info.encoding_position"] = _literal(
+            encoding["position"]
+        )
+        params.setdefault("root.info.default_slice_index", _literal(0))
 
     def _add_runtime_defaults(self, *, params: dict[str, Any]) -> None:
         """Add generic runtime helpers used by gammaSTAR plots/import."""
@@ -3593,11 +6009,46 @@ class GenericGammaStarDocumentBuilder:
             "root.LoopInfo": _literal({}),
             "root.PNSPaths": _literal({}),
             "root.kernel_info": _literal({}),
-            "root.fov": _literal([1.0, 1.0, 1.0]),
-            "root.mat_size": _literal([1, 1, 1]),
+            # Keep the global geometry and each ADC header on one shared set of
+            # live protocol relationships. This is important whenever spatial
+            # metadata is incomplete (for example, an RF+ADC acquisition with
+            # no gradients): the ADC sample count still defines a meaningful
+            # acquisition matrix, while FOV remains a neutral protocol value.
+            "root.fov": _expr(
+                inputs={
+                    "fov": "root.prot.fov",
+                    "slice_thickness": "root.prot.slice_thickness",
+                },
+                script=(
+                    "local z = tonumber(slice_thickness) or 1.0\n"
+                    "if z <= 0 then z = 1.0 end\n"
+                    "if type(fov) == 'table' then\n"
+                    "  local x = tonumber(fov[1]) or 1.0\n"
+                    "  local y = tonumber(fov[2]) or x\n"
+                    "  local fz = tonumber(fov[3]) or z\n"
+                    "  return {x, y, fz}\n"
+                    "end\n"
+                    "local x = tonumber(fov) or 1.0\n"
+                    "if x <= 0 then x = 1.0 end\n"
+                    "return {x, x, z}"
+                ),
+            ),
+            "root.mat_size": _expr(
+                inputs={
+                    "n_x": "root.prot.n_x",
+                    "n_y": "root.prot.n_y",
+                    "n_z": "root.prot.n_z",
+                },
+                script=(
+                    "local nx = math.max(1, math.floor((tonumber(n_x) or 1) + 0.5))\n"
+                    "local ny = math.max(1, math.floor((tonumber(n_y) or 1) + 0.5))\n"
+                    "local nz = math.max(1, math.floor((tonumber(n_z) or 1) + 0.5))\n"
+                    "return {nx, ny, nz}"
+                ),
+            ),
             "root.acq_size": _expr(
                 inputs={"mat_size": "root.mat_size"},
-                script="return mat_size",
+                script="return {mat_size[1], mat_size[2], mat_size[3]}",
             ),
             "root.RegridTable": _expr(
                 inputs={"kernel_info": "root.kernel_info"},
@@ -3709,6 +6160,292 @@ class GenericGammaStarDocumentBuilder:
         for key, value in defaults.items():
             params.setdefault(key, value)
 
+
+
+def _orientation_lua_script(field: str) -> str:
+    """Return Lua code for live orientation presets."""
+
+    prefix = (
+        "local key = string.lower(tostring(orientation or 'axial'))\n"
+        "if key == 'tra' or key == 'transverse' or key == 'ax' then key = 'axial' end\n"
+        "if key == 'cor' then key = 'coronal' end\n"
+        "if key == 'sag' then key = 'sagittal' end\n"
+    )
+
+    if field == "rotation":
+        return (
+            prefix
+            + "if key == 'coronal' then\n"
+            + "  return {{1,0,0},{0,0,-1},{0,1,0}}\n"
+            + "end\n"
+            + "if key == 'sagittal' then\n"
+            + "  return {{0,0,1},{1,0,0},{0,1,0}}\n"
+            + "end\n"
+            + "return {{1,0,0},{0,1,0},{0,0,1}}"
+        )
+    raise ValueError(f"Unsupported orientation field {field!r}")
+
+
+def _gradient_logical_axis_for_orientation(event: Any) -> str | None:
+    """Return read/phase/slice for a gradient event, with channel fallback."""
+
+    for attr in ("logical_axis", "axis_role", "encoding_role"):
+        try:
+            value = getattr(event, attr)
+        except Exception:
+            value = None
+        value = str(value or "").strip().lower()
+        if value in {"read", "phase", "slice"}:
+            return value
+
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, Mapping):
+        for key in ("logical_axis", "axis_role", "encoding_role"):
+            value = str(metadata.get(key) or "").strip().lower()
+            if value in {"read", "phase", "slice"}:
+                return value
+
+    channel = str(getattr(event, "channel", "") or "").lower()
+    return {"x": "read", "y": "phase", "z": "slice"}.get(channel)
+
+
+
+def _direct_protocol_source_name_from_value(
+    value: Any,
+    live_protocol_values: Mapping[str, Any],
+) -> str | None:
+    """Return a protocol key only for a genuine direct protocol reference.
+
+    This intentionally avoids the broad token-containment logic used by
+    _protocol_source_name_from_value().  For variation strength/step values,
+    compound expressions such as ``-0.5 * n_y / fov`` must not be collapsed to
+    ``fov`` merely because the token appears in the expression.
+    """
+
+    if value is None:
+        return None
+
+    def _candidate_matches(candidate: Any) -> str | None:
+        text = str(candidate or "").strip()
+        if not text:
+            return None
+
+        # Direct string keys such as "fov" or "root.prot.fov".
+        key = _protocol_key(text)
+        if key in live_protocol_values:
+            return key
+
+        # ParameterRef-like canonical strings sometimes include one of these
+        # forms.  Accept only forms that represent one whole protocol symbol,
+        # not expressions containing operators.
+        for prefix in ("root.prot.", "prot.", "protocol."):
+            if text.startswith(prefix):
+                tail = _protocol_key(text[len(prefix):])
+                if tail in live_protocol_values:
+                    return tail
+
+        return None
+
+    if isinstance(value, str):
+        return _candidate_matches(value)
+
+    for attr in ("name", "key", "identity", "symbol", "parameter"):
+        item = getattr(value, attr, None)
+        if item is not None:
+            match = _candidate_matches(item)
+            if match is not None:
+                return match
+
+    # Canonical methods are accepted only when the canonical form is a bare
+    # parameter reference.  Expressions containing operators are rejected here
+    # and evaluated to numeric defaults by the caller.
+    for attr in ("to_canonical", "canonical"):
+        method = getattr(value, attr, None)
+        if callable(method):
+            try:
+                text = str(method()).strip()
+            except Exception:
+                continue
+            if re.search(r"[+\-*/()]", text):
+                continue
+            match = _candidate_matches(text)
+            if match is not None:
+                return match
+
+    # Last resort: string form, but only if it is a bare identifier or a simple
+    # root.prot.<identifier> path.  Reject anything expression-like.
+    text = str(value).strip()
+    if re.search(r"[+\-*/()]", text):
+        return None
+    return _candidate_matches(text)
+
+
+def _protocol_source_name_from_value(
+    value: Any,
+    live_protocol_values: Mapping[str, Any],
+) -> str | None:
+    """Return a protocol key referenced by a symbolic value, if identifiable."""
+
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        key = _protocol_key(value)
+        if key in live_protocol_values:
+            return key
+
+    # Expression/ParameterRef objects in this package generally expose either
+    # to_canonical(), name, key, identity, or symbol-like string forms.
+    candidates: list[str] = []
+
+    for attr in ("to_canonical", "canonical"):
+        method = getattr(value, attr, None)
+        if callable(method):
+            try:
+                candidates.append(str(method()))
+            except Exception:
+                pass
+
+    for attr in ("name", "key", "identity", "symbol", "parameter"):
+        item = getattr(value, attr, None)
+        if item is not None:
+            candidates.append(str(item))
+
+    candidates.append(str(value))
+
+    for candidate in candidates:
+        direct = _protocol_key(candidate)
+        if direct in live_protocol_values:
+            return direct
+
+    # Fall back to token containment. Prefer longer keys so n_y wins before y.
+    keys = sorted(
+        (str(key) for key in live_protocol_values),
+        key=len,
+        reverse=True,
+    )
+    for candidate in candidates:
+        for key in keys:
+            if not key:
+                continue
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(key)}(?![A-Za-z0-9_])", candidate):
+                canonical = _protocol_key(key)
+                if canonical in live_protocol_values:
+                    return canonical
+                if key in live_protocol_values:
+                    return key
+
+    return None
+
+
+def _encoding_frame_info(sequence: Any) -> dict[str, Any]:
+    """Return frozen Python-side encoding-frame metadata for header export.
+
+    The current sprint keeps orientation selectable in Python and exports the
+    selected frame consistently. Live gammaSTAR orientation switching is a later
+    writer task.
+    """
+
+    metadata = getattr(sequence, "metadata", None)
+    frame = None
+    if isinstance(metadata, Mapping):
+        frame = metadata.get("encoding_frame")
+
+    if frame is None:
+        encoding_frame = getattr(sequence, "encoding_frame", None)
+        if encoding_frame is not None:
+            try:
+                frame = encoding_frame.to_dict()
+            except Exception:
+                frame = None
+
+    if not isinstance(frame, Mapping):
+        frame = {
+            "name": "axial",
+            "rotation": [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "position": [0.0, 0.0, 0.0],
+            "transform4x4": [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            "convention": "columns_are_read_phase_slice_in_physical_xyz",
+        }
+
+    rotation = _coerce_matrix3(
+        frame.get(
+            "rotation",
+            (
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+        )
+    )
+    position = _coerce_vector3(frame.get("position", (0.0, 0.0, 0.0)))
+
+    transform = frame.get("transform4x4")
+    if not (
+        isinstance(transform, (list, tuple))
+        and len(transform) == 4
+    ):
+        transform = [
+            [rotation[0][0], rotation[0][1], rotation[0][2], position[0]],
+            [rotation[1][0], rotation[1][1], rotation[1][2], position[1]],
+            [rotation[2][0], rotation[2][1], rotation[2][2], position[2]],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    else:
+        transform = [
+            [float(value) for value in row]
+            for row in transform
+        ]
+
+    # Columns are read, phase, slice directions in physical xyz.
+    read_dir = [rotation[0][0], rotation[1][0], rotation[2][0]]
+    phase_dir = [rotation[0][1], rotation[1][1], rotation[2][1]]
+    slice_dir = [rotation[0][2], rotation[1][2], rotation[2][2]]
+
+    return {
+        "name": str(frame.get("name", "encoding")),
+        "rotation": rotation,
+        "position": position,
+        "transform4x4": transform,
+        "convention": str(
+            frame.get(
+                "convention",
+                "columns_are_read_phase_slice_in_physical_xyz",
+            )
+        ),
+        "read_dir": read_dir,
+        "phase_dir": phase_dir,
+        "slice_dir": slice_dir,
+    }
+
+
+def _coerce_matrix3(value: Any) -> list[list[float]]:
+    rows = list(value)
+    if len(rows) != 3:
+        raise ValueError("Encoding rotation must have three rows.")
+    out: list[list[float]] = []
+    for row in rows:
+        row_values = list(row)
+        if len(row_values) != 3:
+            raise ValueError("Encoding rotation rows must have three values.")
+        out.append([float(item) for item in row_values])
+    return out
+
+
+def _coerce_vector3(value: Any) -> list[float]:
+    values = list(value)
+    if len(values) != 3:
+        raise ValueError("Encoding position must have three values.")
+    return [float(item) for item in values]
 
 
 def _find_timing_relationship_for_target(
@@ -3977,6 +6714,8 @@ def _build_protocol_ui_specification(protocol_values: Mapping[str, Any]) -> list
         "Name",
         "sequence_type",
         "seq_dim",
+        "orientation",
+        "slice_orientation",
         "TE",
         "TR",
         "minimal_TE",
@@ -4045,6 +6784,17 @@ def _protocol_ui_entry(key: str, value: Any) -> dict[str, Any] | None:
     path = f"root.prot.{gamma_key}"
     lowered = key.lower()
 
+    # ``seqstar_*`` values are derived/export bookkeeping. They remain in the
+    # protocol graph so relationships can use them, but they must not become
+    # independent editable controls that can disagree with their source values.
+    if lowered.startswith("seqstar_"):
+        return None
+
+    # Symbolic/derived protocol values are displayed through their source
+    # controls rather than exposed as competing editable fields.
+    if _contains_protocol_expression(value):
+        return None
+
     # Vectors/matrices are valid protocol parameters. Only expose the most
     # common geometry vectors in the UI, because arbitrary lists are hard to edit
     # safely in the generic website Protocol Manager.
@@ -4067,6 +6817,50 @@ def _protocol_ui_entry(key: str, value: Any) -> dict[str, Any] | None:
 
     value_type = _protocol_value_type(value)
     if value_type is None:
+        return None
+
+    # Standard-plane orientation. Use a drop-down instead of a generic string:
+    # the gammaSTAR Protocol Manager reliably propagates drop-down changes into
+    # dependent relationships, whereas free-text string controls can appear to
+    # edit visually without invalidating all downstream plot fields.
+    if lowered == "orientation":
+        return _protocol_ui_dict(
+            key=key,
+            path="root.prot.orientation",
+            name="Orientation",
+            description=(
+                "Logical read/phase/slice orientation preset used by "
+                "PyPulseq-Star and the gammaSTAR plot relationships."
+            ),
+            groups=[["PyPulseq-Star", "Protocol"]],
+            value_type="drop_down",
+            options=[
+                {"label": "Axial", "value": "axial"},
+                {"label": "Coronal", "value": "coronal"},
+                {"label": "Sagittal", "value": "sagittal"},
+            ],
+        )
+
+    if lowered in {"phase_encode_order", "phase_order"}:
+        return _protocol_ui_dict(
+            key=key,
+            path=path,
+            name="Phase-encode order",
+            description="Ordering used to assign phase-encode lines to echoes.",
+            groups=[["PyPulseq-Star", "Protocol"]],
+            value_type="drop_down",
+            options=[
+                {"label": "Linear", "value": "linear"},
+                {"label": "Centric", "value": "centric"},
+                {"label": "Reverse", "value": "reverse"},
+            ],
+        )
+
+    # Historical/gammaSTAR geometry name. Hide it from the generic
+    # PyPulseq-Star panel to avoid two editable orientation controls. The
+    # writer below keeps root.prot.slice_orientation aliased to
+    # root.prot.orientation for compatibility with existing documents.
+    if lowered == "slice_orientation":
         return None
 
     # Common timing parameters.  Match the reference style: user-facing ms/us
@@ -4421,8 +7215,59 @@ def _gradient_direction(channel: str | None) -> list[float]:
     return [1.0, 0.0, 0.0]
 
 
+def _gradient_gamma_hz_per_t(gradient_event: Any, data: Mapping[str, Any] | None = None) -> float:
+    """Return the gradient gyromagnetic ratio in Hz/T for unit conversion."""
+
+    data = data or {}
+
+    for key in ("gamma_hz_per_t", "gamma", "gamma_Hz_per_T"):
+        value = data.get(key)
+        if value is not None:
+            try:
+                gamma = float(value)
+                if gamma > 1e5:
+                    return gamma
+            except Exception:
+                pass
+
+    owners = [
+        gradient_event,
+        getattr(gradient_event, "system", None),
+        getattr(gradient_event, "opts", None),
+        getattr(gradient_event, "shape", None),
+    ]
+
+    for owner in owners:
+        if owner is None:
+            continue
+        for key in ("gamma", "gamma_hz_per_t", "gamma_Hz_per_T"):
+            value = getattr(owner, key, None)
+            if value is not None:
+                try:
+                    gamma = float(value)
+                    if gamma > 1e5:
+                        return gamma
+                except Exception:
+                    pass
+
+    # Pulseq/clinical proton default in Hz/T. This fallback should be used only
+    # when no system object is reachable from the event.
+    return 42_575_575.0
+
+
 def _normalize_gradient_data(data: Mapping[str, Any], *, gradient_event: Any) -> dict[str, Any]:
-    """Normalize gradient serialization into gammaSTAR GradPulse payload data."""
+    """Normalize gradient serialization into gammaSTAR GradPulse payload data.
+
+    SeqStar/PyPulseq gradient waveforms are internally represented in
+    frequency-normalized units (Hz/m), following the Pulseq convention. Native
+    gammaSTAR GradPulse samples are interpreted as physical gradient amplitudes
+    in T/m; the website then labels the plot in mT/m. Therefore the export
+    boundary must divide the waveform by gamma exactly once.
+
+    The internal ``area`` is intentionally left in k-space units (1/m), because
+    loop variation tables and phase-encoding formulas are expressed in those
+    same Pulseq-style units.
+    """
 
     data_dict = dict(data)
     if str(data_dict.get("kind", "")).lower() == "split":
@@ -4453,7 +7298,7 @@ def _normalize_gradient_data(data: Mapping[str, Any], *, gradient_event: Any) ->
         ft = float(getattr(shape, "flat_time"))
         rdt = float(getattr(shape, "fall_time"))
         amp = float(getattr(shape, "amplitude"))
-        samples = {"t": [0.0, rut, rut + ft, rut + ft + rdt], "v": [0.0, amp, amp, 0.0]}
+        raw_samples = {"t": [0.0, rut, rut + ft, rut + ft + rdt], "v": [0.0, amp, amp, 0.0]}
     else:
         tt = data_dict.get("tt")
         wf = data_dict.get("waveform")
@@ -4463,12 +7308,46 @@ def _normalize_gradient_data(data: Mapping[str, Any], *, gradient_event: Any) ->
             wf = shape.waveform().tolist()
         if tt is None or wf is None:
             raise ValueError(f"Cannot export gradient waveform for event {gradient_event!r}.")
-        samples = {"t": [float(x) for x in tt], "v": [float(x) for x in wf]}
+        raw_samples = {"t": [float(x) for x in tt], "v": [float(x) for x in wf]}
 
-    values = [float(v) for v in samples.get("v", [])]
+    raw_values = [float(v) for v in raw_samples.get("v", [])]
+    gamma_hz_per_t = _gradient_gamma_hz_per_t(gradient_event, data_dict)
+
+    unit = str(
+        data_dict.get("waveform_unit")
+        or data_dict.get("gradient_unit")
+        or data_dict.get("unit")
+        or "Hz/m"
+    ).strip().lower()
+
+    already_physical = (
+        "t/m" in unit
+        or "tesla" in unit
+        or unit in {"t", "mt/m", "mtesla/m"}
+    )
+
+    if already_physical:
+        physical_values = raw_values
+    else:
+        physical_values = [value / gamma_hz_per_t for value in raw_values]
+
+    samples = {
+        "t": list(raw_samples.get("t", [])),
+        "v": physical_values,
+    }
+
     area = data_dict.get("area", getattr(gradient_event, "area", None))
     if area is not None:
         area = float(area)
+
+    direction = data_dict.get(
+        "physical_direction",
+        getattr(gradient_event, "physical_direction", None),
+    )
+    if direction is None:
+        direction = _gradient_direction(channel)
+    else:
+        direction = [float(value) for value in list(direction)]
 
     return {
         "kind": kind,
@@ -4479,9 +7358,13 @@ def _normalize_gradient_data(data: Mapping[str, Any], *, gradient_event: Any) ->
         "duration": total_duration,
         "area": area,
         "samples": samples,
-        "direction": _gradient_direction(channel),
+        "samples_internal_hz_per_m": raw_samples,
+        "samples_unit": "T/m",
+        "samples_source_unit": unit,
+        "direction": direction,
         "enabled": bool(data_dict.get("enabled", getattr(gradient_event, "enabled", True))),
-        "max_abs_amplitude": max((abs(v) for v in values), default=0.0),
+        "max_abs_amplitude": max((abs(v) for v in physical_values), default=0.0),
+        "max_abs_amplitude_unit": "T/m",
     }
 
 
@@ -5409,6 +8292,10 @@ def _explicit_repeated_node_info(
             repeat_count_ref,
             record.get("counter"),
         )
+        node_loop_token = _repeat_node_loop_token_for_export(
+            node_name,
+            record.get("counter"),
+        )
 
         repeat_mode = str(record.get("repeat_mode") or "").strip().lower()
         if repeat_mode not in {"loop", "expanded"}:
@@ -5424,6 +8311,7 @@ def _explicit_repeated_node_info(
             "repetitions": repetitions,
             "repeat_period": repeat_period,
             "loop_token": loop_token,
+            "node_loop_token": node_loop_token,
         }
 
     return None
@@ -5558,6 +8446,33 @@ def _resolve_repeat_value_for_export(
         return float(value)
     except ValueError:
         return default
+
+
+def _repeat_node_loop_token_for_export(
+    node_name: Any,
+    counter_ref: Any,
+) -> str:
+    """Return the leaf token of the repeated logical node.
+
+    Loop identity and loop length are separate concerns: the node supplies the
+    gammaSTAR path, while ``repeat_count`` supplies the protocol dependency.
+    """
+
+    node = str(node_name or "").strip(".")
+    if node:
+        token = node.rsplit(".", 1)[-1]
+        if token:
+            return token
+
+    if isinstance(counter_ref, str) and counter_ref:
+        token = counter_ref
+        for suffix in ("_index", "_counter"):
+            if token.endswith(suffix):
+                token = token[: -len(suffix)]
+        if token:
+            return token
+
+    return "seqstar_loop"
 
 
 def _repeat_loop_token_for_export(
@@ -6427,6 +9342,52 @@ def _rf_type_string(event: Any) -> str:
     return value
 
 
+
+def _merge_protocol_values_for_export(
+    *,
+    export_sequence: Any,
+    symbolic_sequence: Any | None,
+) -> dict[str, Any]:
+    """Merge numeric export defaults with symbolic protocol relationships.
+
+    GammaStarWriter(seq).write(defaults=resolved) exports the resolved/default
+    sequence for stable numeric event geometry, but protocol-control fields must
+    still come from the symbolic sequence when they are derived relationships.
+
+    Example:
+        phase_encode_start = -0.5 * p.n_y / p.fov
+
+    In the resolved sequence this is already -125.0 for the default 64-line
+    protocol.  If we export that literal, changing root.prot.n_y on gammaSTAR
+    changes the loop length but not the k-space start.  Therefore symbolic
+    protocol expressions from symbolic_sequence must override resolved numeric
+    defaults for root.prot.* export.
+    """
+
+    values = dict(_collect_protocol_values(export_sequence))
+
+    if symbolic_sequence is None or symbolic_sequence is export_sequence:
+        return values
+
+    symbolic_values = _collect_protocol_values(symbolic_sequence)
+    for key, value in symbolic_values.items():
+        key_text = str(key)
+        canonical_key = _protocol_key(key_text)
+
+        # Symbolic relationships override resolved numeric defaults.
+        if _contains_protocol_expression(value):
+            values[key_text] = value
+            values[canonical_key] = value
+            continue
+
+        # Preserve symbolic-only values not present in the resolved export.
+        if key_text not in values and canonical_key not in values:
+            values[key_text] = value
+
+    return values
+
+
+
 def _canonical_protocol_values(values: Mapping[str, Any]) -> dict[str, Any]:
     """Return protocol values with both original and gammaSTAR-canonical keys."""
 
@@ -6482,7 +9443,28 @@ def _collect_protocol_values(sequence: Any) -> dict[str, Any]:
             try:
                 context = protocol.to_template_context()
                 if isinstance(context, Mapping):
-                    values.update(context)
+                    # Do not let a resolved/template context overwrite explicit
+                    # protocol.parameters entries that are still symbolic. This
+                    # is essential for v0.2 protocol-control relationships such
+                    # as:
+                    #
+                    #   phase_encode_start = -0.5 * p.n_y / p.fov
+                    #   phase_encode_step  =  1.0 / p.fov
+                    #
+                    # Protocol.to_template_context() is allowed to contain
+                    # resolved numeric defaults for display/export, but those
+                    # defaults must not replace symbolic protocol relationships
+                    # before _protocol_parameter() has a chance to compile them
+                    # into gammaSTAR inputs/scripts.
+                    for key, value in context.items():
+                        existing = values.get(key)
+                        canonical_existing = values.get(_protocol_key(str(key)))
+                        if (
+                            _contains_protocol_expression(existing)
+                            or _contains_protocol_expression(canonical_existing)
+                        ):
+                            continue
+                        values[key] = value
             except Exception:
                 pass
 
@@ -6625,26 +9607,66 @@ def _slew_to_t_per_m_s(value: float, unit: str) -> float:
     return value
 
 
+def _test_display_key(path: str) -> str:
+    """Return a clean final-hierarchy display key for a test parameter."""
+
+    key = path.removeprefix("root.")
+    replacements = {
+        ".is_timing_increasing_and_rastered_and_same_am_length": ": RF timing/raster/amplitude-length",
+        ".is_adc_windows_timing_increasing_and_valid": ": ADC timing/dwell",
+        ".is_timing_increasing_and_rastered": ": gradient timing/raster",
+    }
+    for suffix, label in replacements.items():
+        if key.endswith(suffix):
+            return key[: -len(suffix)] + label
+    return key
+
+
+def _lua_string(value: Any) -> str:
+    """Return a Lua-safe quoted string literal."""
+
+    return json.dumps(str(value))
+
+
 def _order_sequence_elements(sequence_elements: dict[str, str]) -> dict[str, str]:
     """Return sequence_elements in gammaSTAR-friendly graph order."""
 
     ordered: dict[str, str] = {}
     remaining = dict(sequence_elements)
 
-    preferred_exact_order = [
-        "root",
-        "root.average",
-        "root.average.kernel",
-    ]
+    if "root" in remaining:
+        ordered["root"] = remaining.pop("root")
 
-    for path in preferred_exact_order:
-        if path in remaining:
+    # Preserve the actual exported loop path, e.g. root.ky, rather than
+    # assuming root.average. Service scopes remain after the executable graph.
+    service_scopes = {
+        "root.expo",
+        "root.helper",
+        "root.info",
+        "root.prot",
+        "root.sys",
+        "root.tests",
+    }
+    executable_roots = sorted(
+        (
+            path
+            for path in remaining
+            if path.startswith("root.")
+            and path.count(".") == 1
+            and path not in service_scopes
+        ),
+        key=_hierarchy_sort_key,
+    )
+
+    for executable_root in executable_roots:
+        if executable_root in remaining:
+            ordered[executable_root] = remaining.pop(executable_root)
+        prefix = executable_root + "."
+        for path in sorted(
+            [item for item in list(remaining) if item.startswith(prefix)],
+            key=_hierarchy_sort_key,
+        ):
             ordered[path] = remaining.pop(path)
-
-    kernel_prefix = "root.average.kernel."
-    kernel_paths = [path for path in remaining if path.startswith(kernel_prefix)]
-    for path in sorted(kernel_paths, key=_hierarchy_sort_key):
-        ordered[path] = remaining.pop(path)
 
     service_order = [
         "root.expo",
@@ -6670,6 +9692,9 @@ def _hierarchy_sort_key(path: str) -> tuple[int, list[int], str]:
 
     priority_by_name = {
         "average": 0,
+        "ky": 0,
+        "kx": 0,
+        "kz": 0,
         "kernel": 0,
         "readout": 0,
         "readout2": 0,
@@ -6704,6 +9729,288 @@ def _safe_input_name(path: str) -> str:
     """Convert a dotted path to a Lua-safe input variable name."""
 
     return path.replace(".", "_").replace("-", "_")
+
+
+def _protocol_parameter(
+    value: Any,
+    *,
+    target_path: str,
+) -> dict[str, Any]:
+    """Return a literal or live protocol parameter.
+
+    Sequence definitions such as FOV may contain Protocol symbols, e.g.
+    ``[p.fov, p.fov, p.slice_thickness]``.  Those symbols are expression
+    objects, not JSON/Lua literals, so they must be compiled into gammaSTAR
+    relationships rather than sent through ``_literal()``.
+    """
+
+    if not _contains_protocol_expression(value):
+        return _literal(value)
+
+    inputs: dict[str, str] = {}
+    source_to_name: dict[str, str] = {}
+
+    body = _protocol_value_lua_expression(
+        value,
+        inputs=inputs,
+        source_to_name=source_to_name,
+        target_path=target_path,
+    )
+
+    return _expr(
+        inputs=inputs,
+        script=f"return {body}",
+    )
+
+
+
+def _contains_parameter_reference(value: Any) -> bool:
+    """Return True when a nested expression contains a protocol ParameterRef."""
+
+    if _is_seqstar_expression(value):
+        if hasattr(value, "canonical_name"):
+            return True
+        if hasattr(value, "operand"):
+            return _contains_parameter_reference(value.operand)
+        if hasattr(value, "left") and hasattr(value, "right"):
+            return (
+                _contains_parameter_reference(value.left)
+                or _contains_parameter_reference(value.right)
+            )
+        return False
+
+    if isinstance(value, Mapping):
+        return any(
+            _contains_parameter_reference(key)
+            or _contains_parameter_reference(item)
+            for key, item in value.items()
+        )
+
+    if isinstance(value, (list, tuple)):
+        return any(_contains_parameter_reference(item) for item in value)
+
+    return False
+
+
+def _contains_non_protocol_reference(value: Any) -> bool:
+    """Detect event, anchor, block, or other non-protocol references."""
+
+    if _is_seqstar_expression(value):
+        if hasattr(value, "canonical_name"):
+            return False
+
+        kind = getattr(value, "kind", None)
+        if kind is not None:
+            return True
+
+        if hasattr(value, "operand"):
+            return _contains_non_protocol_reference(value.operand)
+        if hasattr(value, "left") and hasattr(value, "right"):
+            return (
+                _contains_non_protocol_reference(value.left)
+                or _contains_non_protocol_reference(value.right)
+            )
+        return False
+
+    if isinstance(value, Mapping):
+        return any(
+            _contains_non_protocol_reference(key)
+            or _contains_non_protocol_reference(item)
+            for key, item in value.items()
+        )
+
+    if isinstance(value, (list, tuple)):
+        return any(_contains_non_protocol_reference(item) for item in value)
+
+    return False
+
+def _contains_protocol_expression(value: Any) -> bool:
+    """Return True when ``value`` recursively contains a SeqStar expression."""
+
+    if _is_seqstar_expression(value):
+        return True
+
+    if isinstance(value, Mapping):
+        return any(
+            _contains_protocol_expression(key)
+            or _contains_protocol_expression(item)
+            for key, item in value.items()
+        )
+
+    if isinstance(value, (list, tuple)):
+        return any(_contains_protocol_expression(item) for item in value)
+
+    return False
+
+
+def _is_seqstar_expression(value: Any) -> bool:
+    """Duck-type the expression layer without importing a specific version."""
+
+    if value is None or not hasattr(value, "to_canonical"):
+        return False
+
+    # Current Expression subclasses expose dependencies, but keep this robust
+    # across minor implementation changes and slotted dataclasses.
+    if hasattr(value, "dependencies"):
+        return True
+
+    # ParameterRef / UnaryExpression / BinaryExpression shape fallback.
+    if hasattr(value, "canonical_name"):
+        return True
+    if hasattr(value, "operator_name") and (
+        hasattr(value, "operand")
+        or (hasattr(value, "left") and hasattr(value, "right"))
+    ):
+        return True
+
+    return False
+
+
+def _protocol_value_lua_expression(
+    value: Any,
+    *,
+    inputs: dict[str, str],
+    source_to_name: dict[str, str],
+    target_path: str,
+) -> str:
+    """Compile a nested Python/protocol value into a Lua expression body."""
+
+    if _is_seqstar_expression(value):
+        return _seqstar_expression_to_lua(
+            value,
+            inputs=inputs,
+            source_to_name=source_to_name,
+            target_path=target_path,
+        )
+
+    if isinstance(value, Mapping):
+        parts: list[str] = []
+        for key, item in value.items():
+            if item is None:
+                continue
+            item_lua = _protocol_value_lua_expression(
+                item,
+                inputs=inputs,
+                source_to_name=source_to_name,
+                target_path=target_path,
+            )
+            if isinstance(key, str) and key.isidentifier():
+                parts.append(f"{key}={item_lua}")
+            else:
+                key_lua = _protocol_value_lua_expression(
+                    key,
+                    inputs=inputs,
+                    source_to_name=source_to_name,
+                    target_path=target_path,
+                )
+                parts.append(f"[{key_lua}]={item_lua}")
+        return "{" + ", ".join(parts) + "}"
+
+    if isinstance(value, (list, tuple)):
+        return "{" + ", ".join(
+            _protocol_value_lua_expression(
+                item,
+                inputs=inputs,
+                source_to_name=source_to_name,
+                target_path=target_path,
+            )
+            for item in value
+        ) + "}"
+
+    return _to_lua(value)
+
+
+def _seqstar_expression_to_lua(
+    expression: Any,
+    *,
+    inputs: dict[str, str],
+    source_to_name: dict[str, str],
+    target_path: str,
+) -> str:
+    """Compile simple protocol expressions into Lua.
+
+    This intentionally supports the expression shapes that can appear in
+    protocol/definition values: ParameterRef, LiteralExpression, UnaryExpression,
+    and BinaryExpression.  Event/block references are executable-graph concepts
+    and should not be embedded directly inside root.prot values.
+    """
+
+    if hasattr(expression, "canonical_name"):
+        source_path = f"root.prot.{_protocol_key(str(expression.canonical_name))}"
+        if source_path == target_path:
+            # Avoid accidental self-references.  This path should normally not
+            # occur because actual protocol parameter values are literals, while
+            # aliases/definitions reference other protocol parameters.
+            raise TypeError(
+                f"Protocol expression for {target_path!r} references itself."
+            )
+        if source_path not in source_to_name:
+            name = _safe_input_name(source_path)
+            base = name
+            suffix = 2
+            used = set(inputs)
+            while name in used:
+                name = f"{base}_{suffix}"
+                suffix += 1
+            source_to_name[source_path] = name
+            inputs[name] = source_path
+        return source_to_name[source_path]
+
+    if hasattr(expression, "value") and not hasattr(expression, "operator_name"):
+        return _to_lua(expression.value)
+
+    operator_name = getattr(expression, "operator_name", None)
+
+    if operator_name is not None and hasattr(expression, "operand"):
+        operand = _seqstar_expression_to_lua(
+            expression.operand,
+            inputs=inputs,
+            source_to_name=source_to_name,
+            target_path=target_path,
+        )
+        if operator_name == "neg":
+            return f"(-({operand}))"
+
+    if (
+        operator_name is not None
+        and hasattr(expression, "left")
+        and hasattr(expression, "right")
+    ):
+        left = _seqstar_expression_to_lua(
+            expression.left,
+            inputs=inputs,
+            source_to_name=source_to_name,
+            target_path=target_path,
+        )
+        right = _seqstar_expression_to_lua(
+            expression.right,
+            inputs=inputs,
+            source_to_name=source_to_name,
+            target_path=target_path,
+        )
+        operator_map = {
+            "add": "+",
+            "sub": "-",
+            "mul": "*",
+            "truediv": "/",
+            "pow": "^",
+        }
+        if operator_name in operator_map:
+            return f"(({left}) {operator_map[operator_name]} ({right}))"
+
+    raise TypeError(
+        "Cannot compile protocol expression to Lua literal/relationship: "
+        f"{type(expression).__name__}."
+    )
+
+
+def _safe_float_or_none(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
 
 
 def _literal(value: Any) -> dict[str, Any]:

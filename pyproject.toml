@@ -21,7 +21,7 @@ keywords = [
   "reproducible research",
 ]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Pre-Alpha",
   "Intended Audience :: Science/Research",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
@@ -101,7 +101,19 @@ select = ["E", "F", "I", "B", "UP", "N"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-ra"
+addopts = "-ra --strict-markers"
+markers = [
+  "unit: fast tests for one subsystem or API contract",
+  "integration: tests crossing package boundaries",
+  "smoke: minimal end-to-end checks",
+  "optional: tests requiring optional dependencies",
+  "sequence: reference-sequence acceptance tests",
+  "semantic: guards against sequence-specific intrusions in generic layers",
+  "fid: FID reference-sequence tests",
+  "gre: GRE reference-sequence tests",
+  "epi: EPI reference-sequence tests",
+  "tse: TSE reference-sequence tests",
+]
 
 [tool.coverage.run]
 source = ["pypulseq_star"]
@@ -110,6 +122,13 @@ branch = true
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
+fail_under = 65
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+]
 
 [tool.mypy]
 python_version = "3.10"

@@ -22,6 +22,15 @@ from typing import Any, Literal
 import numpy as np
 
 from pypulseq_star.events.grad import SeqStarGradientEvent
+from pypulseq_star.geometry import normalize_logical_axis
+from pypulseq_star.expressions import Expression
+from ._symbolic import (
+    attach_symbolic_specs,
+    evaluate_default,
+    resolve_float,
+    resolve_optional_float,
+    symbolic_specs,
+)
 from pypulseq_star.shapes.grad import (
     SeqStarArbitraryGradientShape,
     SeqStarSplitGradientShape,
@@ -29,6 +38,26 @@ from pypulseq_star.shapes.grad import (
 )
 
 _EPS = 1e-12
+
+
+
+def _logical_gradient_metadata(
+    *,
+    channel: str,
+    axis_role: str | None,
+    encoding_role: str | None,
+    metadata: dict[str, Any] | None,
+) -> tuple[str, str, dict[str, Any]]:
+    """Normalize logical gradient metadata for all gradient constructors."""
+
+    logical_axis = normalize_logical_axis(
+        axis_role or encoding_role,
+        channel=channel,
+    )
+    out = dict(metadata or {})
+    out.setdefault("logical_axis", logical_axis)
+    out.setdefault("axis_role", logical_axis)
+    return logical_axis, logical_axis, out
 
 
 def _default_system() -> Any:
@@ -120,6 +149,106 @@ def make_trapezoid(
 
     if system is None:
         system = _default_system()
+
+    constructor_specs = {
+        "channel": channel,
+        "amplitude": amplitude,
+        "area": area,
+        "delay": delay,
+        "duration": duration,
+        "fall_time": fall_time,
+        "flat_area": flat_area,
+        "flat_time": flat_time,
+        "max_grad": max_grad,
+        "max_slew": max_slew,
+        "rise_time": rise_time,
+        "name": name,
+        "role": role,
+        "axis_role": axis_role,
+        "encoding_role": encoding_role,
+        "polarity": polarity,
+        "metadata": dict(metadata or {}),
+    }
+
+    symbolic_event_specs = symbolic_specs(
+        amplitude=amplitude,
+        area=area,
+        delay=delay,
+        duration=duration,
+        fall_time=fall_time,
+        flat_area=flat_area,
+        flat_time=flat_time,
+        max_grad=max_grad,
+        max_slew=max_slew,
+        rise_time=rise_time,
+    )
+
+    unresolved_constructor_fields: set[str] = set()
+
+    def _resolve_optional_constructor_float(
+        value: Any,
+        *,
+        field_name: str,
+    ) -> float | None:
+        if value is None:
+            return None
+        resolved = evaluate_default(
+            value,
+            fallback=None,
+            field_name=field_name,
+        )
+        if resolved is None:
+            unresolved_constructor_fields.add(field_name)
+            return None
+        return float(resolved)
+
+    amplitude = _resolve_optional_constructor_float(
+        amplitude,
+        field_name="amplitude",
+    )
+    area = _resolve_optional_constructor_float(
+        area,
+        field_name="area",
+    )
+    resolved_delay = evaluate_default(
+        delay,
+        fallback=None,
+        field_name="gradient delay",
+    )
+    if resolved_delay is None:
+        unresolved_constructor_fields.add("delay")
+        delay = 0.0
+    else:
+        delay = float(resolved_delay)
+
+    duration = _resolve_optional_constructor_float(
+        duration,
+        field_name="duration",
+    )
+    fall_time = _resolve_optional_constructor_float(
+        fall_time,
+        field_name="fall_time",
+    )
+    flat_area = _resolve_optional_constructor_float(
+        flat_area,
+        field_name="flat_area",
+    )
+    flat_time = _resolve_optional_constructor_float(
+        flat_time,
+        field_name="flat_time",
+    )
+    max_grad = _resolve_optional_constructor_float(
+        max_grad,
+        field_name="max_grad",
+    )
+    max_slew = _resolve_optional_constructor_float(
+        max_slew,
+        field_name="max_slew",
+    )
+    rise_time = _resolve_optional_constructor_float(
+        rise_time,
+        field_name="rise_time",
+    )
     grad_raster_time = _system_value(system, "grad_raster_time", 10e-6)
     if max_grad is None:
         max_grad = _system_value(system, "max_grad", 28e6)
@@ -128,6 +257,17 @@ def make_trapezoid(
 
     if channel not in {"x", "y", "z"}:
         raise ValueError(f"Invalid channel. Must be one of 'x', 'y', or 'z'. Passed: {channel!r}")
+    if axis_role is not None and str(axis_role).lower() not in {"read", "phase", "slice"}:
+        raise ValueError("axis_role must be one of 'read', 'phase', or 'slice'.")
+    if encoding_role is not None and str(encoding_role).lower() not in {"read", "phase", "slice"}:
+        raise ValueError("encoding_role must be one of 'read', 'phase', or 'slice'.")
+
+    axis_role, encoding_role, metadata = _logical_gradient_metadata(
+        channel=channel,
+        axis_role=axis_role,
+        encoding_role=encoding_role,
+        metadata=metadata,
+    )
 
     if rise_time is None and fall_time is not None:
         rise_time = fall_time
@@ -243,7 +383,7 @@ def make_trapezoid(
         role=role,
         metadata=dict(metadata or {}),
     )
-    return SeqStarGradientEvent(
+    event = SeqStarGradientEvent(
         shape=shape,
         name=name,
         role=role,
@@ -252,6 +392,38 @@ def make_trapezoid(
         polarity=polarity,
         metadata=dict(metadata or {}),
         system=system,
+    )
+
+    provisional_duration = (
+        float(rise_time)
+        + float(flat_time)
+        + float(fall_time)
+    )
+    constructor_metadata = {
+        "family": "trapezoid",
+        "specs": constructor_specs,
+        "unresolved_fields": sorted(unresolved_constructor_fields),
+        "provisional_duration": provisional_duration,
+    }
+
+    event_metadata = getattr(event, "metadata", None)
+    if isinstance(event_metadata, dict):
+        event_metadata["symbolic_constructor"] = constructor_metadata
+
+    event_parameters = getattr(event, "parameters", None)
+    if isinstance(event_parameters, dict):
+        event_parameters["_symbolic_constructor"] = constructor_metadata
+
+    placeholders = {
+        property_name: getattr(event, property_name, None)
+        for property_name in symbolic_event_specs
+        if property_name in unresolved_constructor_fields
+    }
+
+    return attach_symbolic_specs(
+        event,
+        symbolic_event_specs,
+        placeholders=placeholders,
     )
 
 
@@ -277,6 +449,19 @@ def make_arbitrary_grad(
 
     if system is None:
         system = _default_system()
+
+    symbolic_event_specs = symbolic_specs(
+        first=first,
+        last=last,
+        delay=delay,
+        max_grad=max_grad,
+        max_slew=max_slew,
+    )
+    first = None if first is None else resolve_float(first, field_name="first")
+    last = None if last is None else resolve_float(last, field_name="last")
+    delay = resolve_float(delay, field_name="gradient delay")
+    max_grad = None if max_grad is None else resolve_float(max_grad, field_name="max_grad")
+    max_slew = None if max_slew is None else resolve_float(max_slew, field_name="max_slew")
     grad_raster_time = _system_value(system, "grad_raster_time", 10e-6)
     if max_grad is None or max_grad == 0:
         max_grad = _system_value(system, "max_grad", 28e6)
@@ -285,6 +470,18 @@ def make_arbitrary_grad(
 
     if channel not in {"x", "y", "z"}:
         raise ValueError(f"Invalid channel. Must be one of 'x', 'y', or 'z'. Passed: {channel!r}")
+
+    if axis_role is not None and str(axis_role).lower() not in {"read", "phase", "slice"}:
+        raise ValueError("axis_role must be one of 'read', 'phase', or 'slice'.")
+    if encoding_role is not None and str(encoding_role).lower() not in {"read", "phase", "slice"}:
+        raise ValueError("encoding_role must be one of 'read', 'phase', or 'slice'.")
+
+    axis_role, encoding_role, metadata = _logical_gradient_metadata(
+        channel=channel,
+        axis_role=axis_role,
+        encoding_role=encoding_role,
+        metadata=metadata,
+    )
 
     delay = _round_to_raster(delay, grad_raster_time)
     shape = SeqStarArbitraryGradientShape(
@@ -299,7 +496,7 @@ def make_arbitrary_grad(
         metadata=dict(metadata or {}),
     )
     shape.validate(max_grad=max_grad, max_slew=max_slew)
-    return SeqStarGradientEvent(
+    event = SeqStarGradientEvent(
         shape=shape,
         name=name,
         role=role,
@@ -309,6 +506,7 @@ def make_arbitrary_grad(
         metadata=dict(metadata or {}),
         system=system,
     )
+    return attach_symbolic_specs(event, symbolic_event_specs)
 
 
 def make_arbitrary_gradient(*args: Any, **kwargs: Any) -> SeqStarGradientEvent:

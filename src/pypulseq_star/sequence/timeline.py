@@ -95,8 +95,8 @@ class SeqStarTimeline:
         *,
         parent: str | None = None,
         role: str | None = None,
-        repeat_every: str | float | None = None,
-        repeat_count: str | int | None = None,
+        repeat_every: Any | None = None,
+        repeat_count: Any | None = None,
         counter: str | None = None,
         repeat_mode: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -147,6 +147,7 @@ class SeqStarTimeline:
                 "repeat_count": repeat_count if repeat_count is not None else record.get("repeat_count"),
                 "counter": counter if counter is not None else record.get("counter"),
                 "repeat_mode": repeat_mode if repeat_mode is not None else record.get("repeat_mode"),
+                "variations": list(record.get("variations", []) or []),
             }
         )
         if metadata:
