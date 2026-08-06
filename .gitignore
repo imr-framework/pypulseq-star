@@ -86,3 +86,4 @@ outputs/
 *.temp
 .cache/
 tmp/
+.venv310/
