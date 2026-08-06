@@ -134,3 +134,18 @@ exclude_lines = [
 python_version = "3.10"
 strict = true
 packages = ["pypulseq_star"]
+
+[[tool.mypy.overrides]]
+module = [
+  "sympy",
+  "sympy.*",
+  "pypulseq",
+  "pypulseq.*",
+  "mplcursors",
+  "mplcursors.*",
+  "networkx",
+  "networkx.*",
+  "netgraph",
+  "netgraph.*",
+]
+ignore_missing_imports = true
