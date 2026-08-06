@@ -1,13 +1,22 @@
 name: lint
 
 on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
+    name: Ruff and MyPy
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -31,6 +40,6 @@ jobs:
           --select E4,E7,E9,F,I
           --ignore E501
 
-      - name: MyPy
+      - name: MyPy diagnostic
         continue-on-error: true
         run: python -m mypy --config-file pyproject.toml src/pypulseq_star

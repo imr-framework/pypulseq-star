@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -21,11 +21,9 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
           cache: pip
@@ -42,13 +40,12 @@ jobs:
           --select E4,E7,E9,F,I
           --ignore E501
 
-      - name: Run MyPy informational check
+      - name: MyPy diagnostic
         continue-on-error: true
         run: python -m mypy --config-file pyproject.toml src/pypulseq_star
 
   tests:
     name: Tests / Python ${{ matrix.python-version }}
-    needs: quality
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -61,11 +58,9 @@ jobs:
       MPLBACKEND: Agg
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -81,7 +76,6 @@ jobs:
 
   coverage:
     name: Coverage gate (65%)
-    needs: tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -89,13 +83,11 @@ jobs:
       MPLBACKEND: Agg
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
 
@@ -105,7 +97,7 @@ jobs:
           python -m pip install -e ".[dev,plotting]"
 
       - name: Run branch coverage and generate reports
-        run: >
+        run: >-
           python -m pytest
           --cov=pypulseq_star
           --cov-branch
@@ -127,8 +119,7 @@ jobs:
           if-no-files-found: warn
 
   clean-install:
-    name: Build and clean install / Python ${{ matrix.python-version }}
-    needs: coverage
+    name: Build, clean install, and smoke test
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
@@ -141,11 +132,9 @@ jobs:
       MPLBACKEND: Agg
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -183,7 +172,7 @@ jobs:
           PY
 
       - name: Run installation and demo smoke tests
-        run: >
+        run: >-
           python -m pytest
           tests/tests/integration/test_installation.py
           tests/tests/integration/test_four_demos.py
