@@ -1,12 +1,12 @@
 """Sequence-agnostic constraints for pypulseq_star feasibility."""
 from __future__ import annotations
 
-from .base import Constraint, EvaluationState
-from .system import system_constraints
-from .timing import timing_constraints
 from .adc import adc_constraints
+from .base import Constraint, EvaluationState
 from .gradients import gradient_constraints
 from .rf import rf_constraints
+from .system import system_constraints
+from .timing import timing_constraints
 
 
 def default_constraints() -> list[Constraint]:

@@ -35,16 +35,15 @@ import copy
 import inspect
 import math
 import warnings
-from time import perf_counter
 from collections.abc import Iterable, Mapping
 from dataclasses import fields, is_dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import numpy as np
 import pypulseq as pp
 
-from pypulseq_star.calc_duration import calc_duration
 from pypulseq_star.writers._realization import sequence_view
 
 
@@ -1261,7 +1260,8 @@ def _ordinary_events_to_pulseq_with_rotation(
     nongradients=[event for event in events if not _is_gradient_event(event)]
     result=[_to_pypulseq_event(event,system) for event in nongradients]
     result=[event for event in result if event is not None]
-    if not gradients: return result
+    if not gradients: 
+        return result
 
     directions=[_gradient_physical_direction(event) for event in gradients]
     axis_aligned=all(
@@ -1296,13 +1296,15 @@ def _ordinary_events_to_pulseq_with_rotation(
         if tt.size != waveform.size:
             raise ValueError("Gradient time and waveform arrays must have equal length for rotation.")
         logical=np.interp(sample_times,tt,waveform,left=0.0,right=0.0)
-        for axis in range(3): physical[axis]+=direction[axis]*logical
+        for axis in range(3): 
+            physical[axis]+=direction[axis]*logical
 
     max_grad=float(getattr(system,"max_grad",float("inf")))
     max_slew=float(getattr(system,"max_slew",float("inf")))
     for axis,channel in enumerate(("x","y","z")):
         waveform=physical[axis]
-        if not np.any(np.abs(waveform)>1e-12): continue
+        if not np.any(np.abs(waveform)>1e-12): 
+            continue
         if np.max(np.abs(waveform))>max_grad*(1+1e-12):
             raise ValueError(f"Rotated {channel}-gradient exceeds max_grad.")
         if waveform.size>1 and np.max(np.abs(np.diff(waveform))/raster)>max_slew*(1+1e-12):
@@ -1997,9 +1999,12 @@ def _trapezoid_gradient_to_pypulseq(
     amplitude = _gradient_value(event, keys=("amplitude", "amp"), default=None)
     flat_area = _gradient_value(event, keys=("flat_area",), default=None)
     area = _gradient_value(event, keys=("area",), default=None)
-    if amplitude is not None: amplitude = float(amplitude) * scale
-    if flat_area is not None: flat_area = float(flat_area) * scale
-    if area is not None: area = float(area) * scale
+    if amplitude is not None: 
+        amplitude = float(amplitude) * scale
+    if flat_area is not None: 
+        flat_area = float(flat_area) * scale
+    if area is not None: 
+        area = float(area) * scale
 
     rise_time = _gradient_value(event, keys=("rise_time", "rut"), default=None)
     flat_time = _gradient_value(event, keys=("flat_time", "ft"), default=None)
@@ -2559,7 +2564,6 @@ def _emit_nested_node_timeline(
             for iteration in range(count):
                 child_context = dict(context)
                 child_context[counter] = iteration
-                before = emitted_total
                 child_duration = emit_range(
                     range_blocks[i:j],
                     child,

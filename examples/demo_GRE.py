@@ -22,9 +22,8 @@ import math
 from pathlib import Path
 
 import pypulseq_star as ppstar
-from pypulseq_star.writers import GammaStarWriter, PulseqWriter
 from pypulseq_star.sequence import vary
-
+from pypulseq_star.writers import GammaStarWriter, PulseqWriter
 
 ORIENTATION = "axial"  # "axial", "coronal", or "sagittal"
 

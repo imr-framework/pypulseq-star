@@ -13,7 +13,6 @@ from pypulseq_star.shapes.rf import (
     _sinc,
 )
 
-
 pytestmark = pytest.mark.unit
 GAMMA = 42.575575e6
 

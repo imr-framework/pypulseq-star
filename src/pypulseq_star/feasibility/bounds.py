@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable
 
 from pypulseq_star.constraints.base import protocol_values as collect_protocol_values
 from pypulseq_star.feasibility.diagnostics import FeasibilityDiagnostic
@@ -170,7 +170,8 @@ def _candidate_grid(
         # Uniform integer subsampling plus endpoints/current.
         step = max(1, int(math.ceil(span / max(1, steps))))
         values = set(range(lo, hi + 1, step))
-        values.add(lo); values.add(hi)
+        values.add(lo)
+        values.add(hi)
         try:
             values.add(int(round(float(current))))
         except Exception:

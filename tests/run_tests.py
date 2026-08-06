@@ -35,12 +35,11 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from typing import Sequence
-import textwrap
 
 import pytest
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEST_ROOT = REPO_ROOT / "tests"

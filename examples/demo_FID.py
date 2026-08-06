@@ -22,7 +22,6 @@ import pypulseq_star as ppstar
 from pypulseq_star.writers import GammaStarWriter, PulseqWriter
 
 
-
 def _launch_relationship_dashboard(
     seq: ppstar.Sequence,
     output_dir: Path,

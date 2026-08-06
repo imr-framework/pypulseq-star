@@ -37,7 +37,6 @@ from pypulseq_star.constraints.timing import (
     _timing_raster_alignment,
 )
 
-
 pytestmark = pytest.mark.unit
 
 

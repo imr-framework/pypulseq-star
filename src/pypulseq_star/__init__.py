@@ -3,20 +3,31 @@
 from __future__ import annotations
 
 from pypulseq_star import relationships as relationships
+from pypulseq_star.expressions import (
+    EvaluationContext,
+    Expression,
+    ParameterNamespace,
+    ParameterRef,
+)
+from pypulseq_star.feasibility import (
+    evaluate_feasibility,
+    feasible_range,
+    sweep_parameters,
+)
+from pypulseq_star.geometry import EncodingFrame
 from pypulseq_star.make import (
     make_adc,
     make_adc_train,
     make_arbitrary_grad,
     make_arbitrary_rf,
     make_block_pulse,
+    make_delay,
     make_gauss_pulse,
     make_sinc_pulse,
     make_trapezoid,
     split_gradient,
-    make_delay,
 )
 from pypulseq_star.opts import Opts
-from pypulseq_star.geometry import EncodingFrame
 from pypulseq_star.plotting.plotter import SeqStarPlotter, plot
 from pypulseq_star.plotting.relationship_grapher import (
     RelationshipGrapher,
@@ -27,19 +38,7 @@ from pypulseq_star.plotting.relationship_grapher import (
     write_relationship_graph_mermaid,
 )
 from pypulseq_star.protocol import Protocol
-from pypulseq_star.expressions import (
-    EvaluationContext,
-    Expression,
-    ParameterNamespace,
-    ParameterRef,
-)
 from pypulseq_star.sequence import SeqStarSequence as Sequence
-
-from pypulseq_star.feasibility import (
-    evaluate_feasibility,
-    feasible_range,
-    sweep_parameters,
-)
 
 __version__ = "0.2.0a1"
 # PyPulseq-compatible numerical tolerance.

@@ -6,7 +6,6 @@ import pytest
 
 import pypulseq_star.writers.gammastar_generic_document as gd
 
-
 pytestmark = pytest.mark.unit
 
 

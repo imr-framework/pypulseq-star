@@ -16,15 +16,13 @@ Design goals
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
-import math
 import re
 import shutil
 import subprocess
 import textwrap
-
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 # =============================================================================
 # Data model
@@ -754,7 +752,6 @@ def _plot_relationship_graph_dashboard(
     dpi: int,
 ):
     import matplotlib.pyplot as plt
-    from matplotlib.patches import FancyArrowPatch
 
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     ax.axis("off")
@@ -772,7 +769,6 @@ def _plot_relationship_graph_dashboard(
     # Layout constants
     # ------------------------------------------------------------------
     outer = (0.8, 0.8, 98.4, 98.0)
-    header = (2.0, 92.0, 96.0, 6.0)
     sidebar = (2.0, 4.0, 14.0, 86.5)
     main = (17.0, 4.0, 80.8, 86.5)
 
@@ -782,8 +778,7 @@ def _plot_relationship_graph_dashboard(
     top_right = (76.0, 77.0, 16.5, 10.0)
 
     lane_label_w = 10.0
-    lane_x = 18.0
-    lane_w = 78.8
+
 
     lane_protocol = (18.0, 69.0, 78.8, 6.5)
     lane_structure = (18.0, 44.0, 78.8, 24.0)
@@ -792,7 +787,7 @@ def _plot_relationship_graph_dashboard(
 
     content_left = 18.0 + lane_label_w + 2.0
     content_right = 95.0
-    content_w = content_right - content_left
+
 
     _rounded_panel(ax, *outer, radius=1.1, face="#ffffff", edge="#d5ddeb", lw=1.0, z=0)
 

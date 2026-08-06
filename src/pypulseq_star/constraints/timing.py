@@ -4,10 +4,10 @@ from __future__ import annotations
 from typing import Iterable
 
 from pypulseq_star.feasibility.diagnostics import FeasibilityDiagnostic
+
 from .base import (
     Constraint,
     EvaluationState,
-    active_duration,
     approx_raster_aligned,
     block_path,
     event_path,

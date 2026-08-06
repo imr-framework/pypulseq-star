@@ -1,12 +1,28 @@
 from __future__ import annotations
+
 from types import SimpleNamespace
+
 import pytest
-from pypulseq_star.writers.gammastar_literal_validator import *
-from pypulseq_star.relationships.protocol import *
-from pypulseq_star.relationships.lua_backend import relationship_to_lua_payload
-from pypulseq_star.relationships.sympy_backend import *
+
 from pypulseq_star.relationships.expression import SeqStarExpression
+from pypulseq_star.relationships.lua_backend import relationship_to_lua_payload
+from pypulseq_star.relationships.protocol import (
+    MissingProtocolParameterError,
+    is_protocol_reference,
+    require_protocol_parameters,
+)
 from pypulseq_star.relationships.relationship import SeqStarRelationship
+from pypulseq_star.relationships.sympy_backend import (
+    SymbolicDependencyGraph,
+    graph_from_gammastar_parameters,
+    parameter_is_literal,
+)
+from pypulseq_star.writers.gammastar_literal_validator import (
+    GammaStarLiteralValidationError,
+    GammaStarLiteralValidator,
+    LiteralIssue,
+    LiteralValidationReport,
+)
 
 pytestmark=pytest.mark.unit
 
@@ -40,8 +56,10 @@ def test_literal_validator_classification_and_repairs():
 def test_protocol_lua_and_symbolic_backends():
     seq=SimpleNamespace(parameters={'TE':0.01})
     require_protocol_parameters(seq,['TE'])
-    with pytest.raises(MissingProtocolParameterError): require_protocol_parameters(seq,['TR'])
-    with pytest.raises(MissingProtocolParameterError): require_protocol_parameters(SimpleNamespace(),['TE'])
+    with pytest.raises(MissingProtocolParameterError): 
+        require_protocol_parameters(seq,['TR'])
+    with pytest.raises(MissingProtocolParameterError): 
+        require_protocol_parameters(SimpleNamespace(),['TE'])
     assert is_protocol_reference('TE') and not is_protocol_reference(1)
     expr=SeqStarExpression(canonical='x+1',lua='return x+1',inputs={'x':'root.prot.x'})
     rel=SeqStarRelationship(name='r', relation_type='custom', description='test', expression=expr, resolved={'y':2})

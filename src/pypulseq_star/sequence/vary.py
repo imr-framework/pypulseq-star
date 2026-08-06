@@ -33,10 +33,9 @@ may lower the same declaration into expanded numeric event occurrences.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
-
 
 _ALLOWED_MODES = {
     "linear",

@@ -20,6 +20,7 @@ from typing import Any
 
 from pypulseq_star.events.delay import SeqStarDelayEvent
 from pypulseq_star.expressions import Expression
+
 from ._symbolic import attach_symbolic_specs, evaluate_default, symbolic_specs
 
 

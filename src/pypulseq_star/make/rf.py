@@ -7,15 +7,15 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from pypulseq_star.events import SeqStarRFBlockEvent
+from pypulseq_star.expressions import EventPropertyRef, Expression
 from pypulseq_star.opts import Opts
 from pypulseq_star.shapes import SeqStarRFBlockShape
-from pypulseq_star.expressions import EventPropertyRef, Expression
+
 from ._symbolic import (
     attach_symbolic_specs,
-    evaluate_default,
+    require_positive,
     resolve_float,
     resolve_optional_float,
-    require_positive,
     resolve_string,
     symbolic_specs,
 )

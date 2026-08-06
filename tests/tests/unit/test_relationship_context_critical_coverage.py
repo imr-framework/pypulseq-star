@@ -20,7 +20,6 @@ from pypulseq_star.relationships.context import (
     try_adc_duration,
 )
 
-
 pytestmark = pytest.mark.unit
 
 

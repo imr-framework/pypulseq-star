@@ -30,8 +30,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,plotting]"
-      - name: Ruff
-        run: python -m ruff check src tests examples
+      - name: Lint critical errors
+        run: >
+          python -m ruff check src tests examples
+          --select E4,E7,E9,F,I
+          --ignore E501
       - name: Mypy
         run: python -m mypy src/pypulseq_star
 

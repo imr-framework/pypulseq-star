@@ -7,20 +7,20 @@ Run from the repository root:
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
-from collections import defaultdict
 import argparse
 import copy
 import json
 import re
 import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
 
 import streamlit as st
 
 try:
     from streamlit_flow import streamlit_flow
-    from streamlit_flow.elements import StreamlitFlowNode, StreamlitFlowEdge
+    from streamlit_flow.elements import StreamlitFlowEdge, StreamlitFlowNode
     from streamlit_flow.state import StreamlitFlowState
     try:
         from streamlit_flow.layouts import ManualLayout
@@ -243,7 +243,7 @@ def _prepare_display_spec(spec: dict[str, Any]) -> dict[str, Any]:
         show_events = False
         compact_repeated = True
 
-    node_by_id = {str(node.get("id")): node for node in nodes}
+
     node_map: dict[str, str] = {}
     grouped: dict[str, dict[str, Any]] = {}
     kept_nodes: list[dict[str, Any]] = []

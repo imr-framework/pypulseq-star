@@ -30,10 +30,9 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any
-
 
 # ---------------------------------------------------------------------------
 # Import the neighboring examples/demo_FID.py without requiring examples to be

@@ -6,7 +6,6 @@ import pytest
 
 import pypulseq_star.writers.seq_writer as sw
 
-
 pytestmark = pytest.mark.unit
 
 

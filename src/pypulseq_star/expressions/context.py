@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol as TypingProtocol, runtime_checkable
+from typing import Any, runtime_checkable
+from typing import Protocol as TypingProtocol
 
 from .diagnostics import ExpressionDiagnostic
 from .errors import CircularExpressionError, UnknownReferenceError

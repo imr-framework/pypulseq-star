@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import math
 import os
-
 from collections.abc import Iterable, Mapping
 from dataclasses import fields, is_dataclass
 from typing import Any
@@ -34,7 +33,6 @@ from .context import (
 from .expression import expr
 from .relationship import SeqStarRelationship, attach_relationship, get_relationships
 from .validation import SeqStarValidationResult, validation_result
-
 
 # Object-id based lookup is intentionally simple for Phase 1. The relationship
 # record keeps object ids for debug/serialization safety, but the live

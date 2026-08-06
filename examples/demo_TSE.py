@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,6 @@ import numpy as np
 import pypulseq_star as ppstar
 from pypulseq_star.bindings import bind_gradient_area_to_loop_table
 from pypulseq_star.writers import GammaStarWriter, PulseqWriter
-
 
 ORIENTATION = "sagittal"  # "axial", "coronal", or "sagittal"
 
@@ -63,7 +63,7 @@ def _launch_relationship_dashboard(
     if not enabled:
         return
 
-    import sys
+
 
     project_root = Path(__file__).resolve().parents[1]
     src_dir = project_root / "src"
@@ -322,7 +322,7 @@ def build_sequence(
     )
     seq.set_definition("Name", p.sequence_name)
 
-    shot = seq.set_node(
+    seq.set_node(
         "shot",
         role="shot",
         repeat_count=p.shot_count,
@@ -331,7 +331,7 @@ def build_sequence(
         repeat_mode="loop",
     )
     seq.set_node("shot.kernel", role="kernel")
-    echo = seq.set_node(
+    seq.set_node(
         "shot.kernel.echo_train",
         role="echo_train",
         repeat_count=p.echo_train_length,

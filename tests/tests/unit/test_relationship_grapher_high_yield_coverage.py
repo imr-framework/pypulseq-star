@@ -1,7 +1,10 @@
 from __future__ import annotations
+
 from pathlib import Path
 from types import SimpleNamespace
+
 import pytest
+
 import pypulseq_star.plotting.relationship_grapher as rg
 
 pytestmark = pytest.mark.unit

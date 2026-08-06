@@ -13,7 +13,6 @@ from typing import Any
 
 from pypulseq_star.expressions import EventAnchorRef, Expression
 
-
 _UNRESOLVED = object()
 
 

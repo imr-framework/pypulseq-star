@@ -46,9 +46,9 @@ import json
 import math
 import os
 import re
-from time import perf_counter
 from collections.abc import Iterable, Mapping
 from dataclasses import fields, is_dataclass
+from time import perf_counter
 from typing import Any
 
 from pypulseq_star.calc_duration import calc_duration
@@ -3116,10 +3116,7 @@ class GenericGammaStarDocumentBuilder:
                 binding.get("attribute") if isinstance(binding, Mapping) else ""
             ).strip().lower()
 
-            total_area = _safe_float_or_none(grad_data.get("area"))
-            max_abs = _safe_float_or_none(
-                grad_data.get("max_abs_amplitude")
-            )
+
 
             # Normalize against the *declared variation value at counter zero*,
             # not against an implementation-specific gradient-data area.  Some
@@ -4291,24 +4288,8 @@ class GenericGammaStarDocumentBuilder:
         first_duration = float(
             _adc_window_value(first_window, "duration", 0.0)
         )
-        first_samples = int(
-            _adc_window_value(
-                first_window,
-                "num_samples",
-                _adc_window_value(first_window, "number_of_samples", 1),
-            )
-        )
-        first_sample_time = float(
-            _adc_window_value(
-                first_window,
-                "sample_time",
-                _adc_window_value(
-                    first_window,
-                    "dwell",
-                    first_duration / max(first_samples, 1),
-                ),
-            )
-        )
+
+
 
         if (
             live_readout_duration_path is not None

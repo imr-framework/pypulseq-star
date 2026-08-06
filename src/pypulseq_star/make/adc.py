@@ -32,7 +32,7 @@ from typing import Any
 from pypulseq_star.events.adc import SeqStarADCEvent
 from pypulseq_star.opts import Opts
 from pypulseq_star.shapes.adc import SeqStarADCTrainShape, SeqStarADCWindow
-from pypulseq_star.expressions import Expression
+
 from ._symbolic import (
     attach_symbolic_specs,
     resolve_float,

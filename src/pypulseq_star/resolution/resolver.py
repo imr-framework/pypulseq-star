@@ -13,6 +13,7 @@ from pypulseq_star.expressions import (
     ExpressionEvaluationError,
     RangeValidationError,
 )
+
 from .resolved_protocol import ResolvedProtocol
 from .resolved_sequence import ResolvedSequence
 

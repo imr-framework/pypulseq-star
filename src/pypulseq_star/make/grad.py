@@ -23,18 +23,17 @@ import numpy as np
 
 from pypulseq_star.events.grad import SeqStarGradientEvent
 from pypulseq_star.geometry import normalize_logical_axis
-from pypulseq_star.expressions import Expression
-from ._symbolic import (
-    attach_symbolic_specs,
-    evaluate_default,
-    resolve_float,
-    resolve_optional_float,
-    symbolic_specs,
-)
 from pypulseq_star.shapes.grad import (
     SeqStarArbitraryGradientShape,
     SeqStarSplitGradientShape,
     SeqStarTrapezoidGradientShape,
+)
+
+from ._symbolic import (
+    attach_symbolic_specs,
+    evaluate_default,
+    resolve_float,
+    symbolic_specs,
 )
 
 _EPS = 1e-12
@@ -543,7 +542,7 @@ def split_gradient(
     delay = _round_to_raster(parent.delay, grad_raster_time)
     rise_time = _round_to_raster(parent.rise_time, grad_raster_time)
     flat_time = _round_to_raster(parent.flat_time, grad_raster_time)
-    fall_time = _round_to_raster(parent.fall_time, grad_raster_time)
+
     amp = parent.amplitude
 
     def _two_sample_part(samples: list[float], part_delay: float, part_name: str) -> SeqStarGradientEvent:

@@ -12,13 +12,13 @@ Key behavior:
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
-from pathlib import Path
-from typing import Any, Mapping
 import json
 import shlex
 import subprocess
 import sys
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+from typing import Any, Mapping
 
 
 def _project_root() -> Path:

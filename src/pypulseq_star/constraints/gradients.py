@@ -4,7 +4,16 @@ from __future__ import annotations
 from typing import Iterable
 
 from pypulseq_star.feasibility.diagnostics import FeasibilityDiagnostic
-from .base import Constraint, EvaluationState, event_path, get_float, is_gradient, iter_block_events, iter_blocks
+
+from .base import (
+    Constraint,
+    EvaluationState,
+    event_path,
+    get_float,
+    is_gradient,
+    iter_block_events,
+    iter_blocks,
+)
 
 
 def gradient_constraints() -> list[Constraint]:

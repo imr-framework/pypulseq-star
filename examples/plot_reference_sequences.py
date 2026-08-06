@@ -42,8 +42,6 @@ PNGs remain available for later manual refinement.
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,13 +54,12 @@ if "--show" not in sys.argv:
 
     matplotlib.use("Agg")
 
-import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw, ImageFont
-
 import demo_EPI
 import demo_FID
 import demo_GRE
 import demo_TSE
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
 
 
 @dataclass(frozen=True)

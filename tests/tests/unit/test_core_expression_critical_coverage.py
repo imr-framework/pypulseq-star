@@ -4,7 +4,6 @@ import pytest
 
 from pypulseq_star.core.expression import SeqStarExpression, _lua_table
 
-
 pytestmark = pytest.mark.unit
 
 

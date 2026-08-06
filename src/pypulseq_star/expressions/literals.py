@@ -9,7 +9,6 @@ from .base import Expression
 from .context import EvaluationContext
 from .errors import InvalidExpressionError
 
-
 _SUPPORTED_LITERAL_TYPES = (int, float, complex, bool, str, type(None))
 
 

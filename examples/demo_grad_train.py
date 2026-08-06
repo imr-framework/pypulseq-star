@@ -33,7 +33,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pypulseq_star as ppstar
 from pypulseq_star.writers import GammaStarWriter, PulseqWriter
 
-
 SUPPORTED_GRADIENT_TYPES = {"trapezoid", "arbitrary", "split", "all"}
 INDIVIDUAL_GRADIENT_TYPES = ("trapezoid", "arbitrary", "split")
 

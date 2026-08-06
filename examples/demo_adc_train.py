@@ -48,7 +48,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import pypulseq_star as ppstar
 from pypulseq_star.writers import GammaStarWriter, PulseqWriter
 
-
 SUPPORTED_ADC_USE_CASES = {
     "single",
     "multi_echo_gre",

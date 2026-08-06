@@ -11,6 +11,7 @@ if str(EXAMPLES) not in sys.path:
     sys.path.insert(0, str(EXAMPLES))
 
 import demo_GRE  # noqa: E402
+
 from pypulseq_star.writers import GammaStarWriter  # noqa: E402
 
 

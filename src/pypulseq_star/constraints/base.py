@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from pypulseq_star.feasibility.diagnostics import FeasibilityDiagnostic

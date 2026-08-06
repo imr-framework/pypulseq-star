@@ -15,7 +15,6 @@ from typing import Any, Mapping
 
 import numpy as np
 
-
 LOGICAL_AXES = ("read", "phase", "slice")
 PHYSICAL_AXES = ("x", "y", "z")
 ORIENTATION_PRESETS = ("axial", "coronal", "sagittal")

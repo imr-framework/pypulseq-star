@@ -1,7 +1,10 @@
 from __future__ import annotations
+
 from types import SimpleNamespace
+
 import numpy as np
 import pytest
+
 import pypulseq_star.plotting.plotter as pl
 
 pytestmark = pytest.mark.unit

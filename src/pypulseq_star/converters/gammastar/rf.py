@@ -9,7 +9,6 @@ from pypulseq_star.core import SeqStarExpression
 from pypulseq_star.events import SeqStarRFEvent
 from pypulseq_star.sequence import SeqStarSequence
 
-
 RF_RECT_BLUEPRINT = "184dfa36-f86e-425f-a653-40d47a4a99b2"
 RF_PULSE_BLUEPRINT = "RFPulse"
 KERNEL_BLUEPRINT = "a6bcd65a-b25b-4fe4-894f-c7fdf4fc8beb"

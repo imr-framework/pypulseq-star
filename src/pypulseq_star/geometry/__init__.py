@@ -1,11 +1,11 @@
 """Spatial encoding geometry."""
 from .encoding import (
-    EncodingFrame,
     LOGICAL_AXES,
-    PHYSICAL_AXES,
     ORIENTATION_PRESETS,
-    normalize_orientation,
+    PHYSICAL_AXES,
+    EncodingFrame,
     normalize_logical_axis,
+    normalize_orientation,
     orientation_choices,
 )
 

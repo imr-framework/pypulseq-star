@@ -4,7 +4,17 @@ from __future__ import annotations
 from typing import Iterable
 
 from pypulseq_star.feasibility.diagnostics import FeasibilityDiagnostic
-from .base import Constraint, EvaluationState, event_path, get_float, get_int, is_adc, iter_block_events, iter_blocks
+
+from .base import (
+    Constraint,
+    EvaluationState,
+    event_path,
+    get_float,
+    get_int,
+    is_adc,
+    iter_block_events,
+    iter_blocks,
+)
 
 
 def adc_constraints() -> list[Constraint]:

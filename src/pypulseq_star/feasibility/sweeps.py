@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-from .bounds import feasible_range, ParameterBoundReport
+from .bounds import ParameterBoundReport, feasible_range
 
 
 def sweep_parameters(

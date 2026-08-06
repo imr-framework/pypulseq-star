@@ -2,33 +2,31 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import copy
 import os
+from dataclasses import dataclass, field
 from typing import Any
 
 from pypulseq_star.blocks import SeqStarBlock
-from pypulseq_star.core import SeqStarNode, SeqStarRelationship
-from pypulseq_star.opts import Opts
-from pypulseq_star.geometry import EncodingFrame
-from pypulseq_star.check_timing import check_timing
 from pypulseq_star.calc_duration import calc_duration as _shared_calc_duration
+from pypulseq_star.check_timing import check_timing
+from pypulseq_star.core import SeqStarNode, SeqStarRelationship
 from pypulseq_star.expressions import (
     AnchorIntervalDurationRef,
     BlockRangeDurationRef,
-    EvaluationContext,
     EventAnchorRef,
     Expression,
-    LiteralExpression,
-    ReferenceExpression,
-    as_expression,
     ExpressionDiagnostic,
-    ExpressionEvaluationError,
+    LiteralExpression,
     RangeValidationError,
+    ReferenceExpression,
     TypeValidationError,
     UnknownReferenceError,
 )
+from pypulseq_star.geometry import EncodingFrame
+from pypulseq_star.opts import Opts
 from pypulseq_star.plotting.plotter import plot
+
 from .timeline import SeqStarTimeline, split_node_path
 from .vary import SeqStarNodeHandle, SeqStarVariation
 

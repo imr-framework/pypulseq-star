@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pypulseq_star.feasibility.diagnostics import FeasibilityDiagnostic
+
 from .base import Constraint, EvaluationState
 
 
