@@ -32,25 +32,28 @@ class Protocol:
     Protocol-control layer for pypulseq_star.
 
     This class captures high-level protocol parameters that are usually present
-    in gammaSTAR-style seq.json/template structures, for example grouped
+    in gammaSTAR-style ``seq.json`` or template structures, for example grouped
     protocol controls under Contrast, Geometry, MT Preparation, PAT, Recon,
     and Special.
 
     The class is intentionally permissive:
-        - Developers may provide only the parameters they need.
-        - Missing parameters are not emitted unless include_unset=True.
-        - Unknown parameters are preserved under the 'special' group by default.
+
+    - Developers may provide only the parameters they need.
+    - Missing parameters are not emitted unless ``include_unset=True``.
+    - Unknown parameters are preserved under the ``special`` group by default.
 
     Example
     -------
-    protocol = ppstar.Protocol(
-        name="Block RF train",
-        description="A simple repeated RF block-pulse train",
-        parameters={
-            "average": 20,
-            "TR": 2.0,
-        },
-    )
+    Create a protocol containing a small set of acquisition parameters::
+
+        protocol = ppstar.Protocol(
+            name="Block RF train",
+            description="A simple repeated RF block-pulse train",
+            parameters={
+                "average": 20,
+                "TR": 2.0,
+            },
+        )
     """
 
     name: str
@@ -60,7 +63,7 @@ class Protocol:
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     strict: bool = False
-
+    
     GROUP_ORDER: ClassVar[tuple[str, ...]] = (
         "contrast",
         "geometry",
