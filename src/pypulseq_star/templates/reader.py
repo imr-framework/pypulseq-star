@@ -1,0 +1,1 @@
+"""Template JSON reader boundary."""
