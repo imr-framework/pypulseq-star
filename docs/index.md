@@ -1,22 +1,28 @@
-# Documentation
+# PyPulseq-Star Documentation
 
-## Start here
+PyPulseq-Star is a relationship-aware, protocol-oriented framework for magnetic resonance pulse-sequence development with support for multiple export backends.
 
-- [README](../README.md)
-- [v0.2.0 release scope](release_scope_v0.2.0.md)
-- [Testing and acceptance](testing_and_acceptance.md)
-- [Architecture](architecture.md)
-- [Object model](object_model.md)
-- [Roadmap](roadmap.md)
+```{toctree}
+:maxdepth: 2
+:caption: Documentation
 
-## Release notes
+release_scope_v0.2.0
+testing_and_acceptance
+architecture
+object_model
+roadmap
+```
 
-- [v0.2.0](releases/v0.2.0.md)
-- [v0.1.0-alpha](releases/v0.1.0-alpha.md)
+```{toctree}
+:maxdepth: 1
+:caption: Release notes
 
-## Project files
+releases/v0.2.0
+```
 
-- [Contributing](../CONTRIBUTING.md)
-- [Support](../SUPPORT.md)
-- [Security](../SECURITY.md)
-- [Citation](../CITATION.cff)
+```{toctree}
+:maxdepth: 2
+:caption: API Reference
+
+api/modules
+```
