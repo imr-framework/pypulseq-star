@@ -53,7 +53,7 @@ from typing import Any
 
 from pypulseq_star.calc_duration import calc_duration
 
-# gammaSTAR generic document writer patch level: v37-adc-header-offcenter-alias
+# gammaSTAR generic document writer patch level: v47-explicit-alias-default-fix
 
 
 RF_RECT_BLUEPRINT = "184dfa36-f86e-425f-a653-40d47a4a99b2"
@@ -518,6 +518,14 @@ class GenericGammaStarDocumentBuilder:
             exported_events=events,
         )
 
+        # Preserve generic symbolic delay durations (for example any delay
+        # authored from Protocol expressions).  This is deliberately not tied
+        # to TE, PRESS, or any sequence family.
+        self._apply_symbolic_delay_bindings(
+            params=params,
+            events=events,
+        )
+
         # Apply declarative loop-dependent event variations such as
         # kernel.vary(vary(gy_pre, "area", ...)). This is intentionally generic:
         # the variation metadata is attached by Sequence/NodeHandle and the
@@ -657,6 +665,11 @@ class GenericGammaStarDocumentBuilder:
             exported_events=events,
         )
 
+        self._apply_explicit_root_execution_schedule_and_validation(
+            params=params,
+            sequence_elements=sequence_elements,
+        )
+
         if not compact_export:
             self._add_stale_literal_tstart_validator(
                 params=params,
@@ -709,6 +722,92 @@ class GenericGammaStarDocumentBuilder:
             document["seqstar_writer_context"]["diagnostics"] = serialized
 
         return document
+
+    def _apply_symbolic_delay_bindings(
+        self,
+        *,
+        params: dict[str, Any],
+        events: Iterable[Any],
+    ) -> None:
+        """Keep protocol-driven delay durations live in gammaSTAR.
+
+        ``make_delay(Expression)`` retains the original expression under the
+        generic ``symbolic_properties`` contract.  The resolved SeqStar timeline
+        contains a numeric duration, but gammaSTAR Protocol Control must consume
+        the original relationship so edits propagate through the sequential
+        block timing chain.
+
+        Unsupported/non-protocol symbolic forms are left at their resolved
+        numeric value, preserving prior export behavior.
+        """
+
+        for event in events:
+            if not _is_delay_event(event):
+                continue
+
+            metadata = getattr(event, "metadata", None)
+            parameters = getattr(event, "parameters", None)
+
+            specs = None
+            if isinstance(metadata, Mapping):
+                candidate = metadata.get("symbolic_properties")
+                if isinstance(candidate, Mapping):
+                    specs = candidate
+            if specs is None and isinstance(parameters, Mapping):
+                candidate = parameters.get("_symbolic_properties")
+                if isinstance(candidate, Mapping):
+                    specs = candidate
+            if not isinstance(specs, Mapping):
+                continue
+
+            duration_spec = specs.get("duration")
+            if duration_spec is None:
+                duration_spec = specs.get("delay")
+            if duration_spec is None:
+                continue
+
+            # Only protocol-driven expressions can be lowered generically to
+            # root.prot.* without mapping event/block references.
+            if not _contains_parameter_reference(duration_spec):
+                continue
+            if _contains_non_protocol_reference(duration_spec):
+                continue
+
+            block_index = _event_source_block_index_for_export(event)
+            if block_index is None:
+                continue
+            block_path = self._block_export_paths.get(int(block_index))
+            if not block_path:
+                continue
+
+            inputs: dict[str, str] = {}
+            source_to_name: dict[str, str] = {}
+            try:
+                body = self._variation_value_lua_expression(
+                    duration_spec,
+                    inputs=inputs,
+                    source_to_name=source_to_name,
+                    target_path=f"{block_path}.duration",
+                )
+            except TypeError:
+                # Backward-compatible fallback: keep the already resolved
+                # numeric duration for unsupported symbolic expression shapes.
+                continue
+
+            # Delay constructors are raster-safe. Preserve that contract in the
+            # interactive backend using the generic gradient/delay raster.
+            inputs["raster"] = "root.sys.raster_time_grad"
+            params[f"{block_path}.duration"] = _expr(
+                inputs=inputs,
+                script=(
+                    f"local requested = {body}\n"
+                    "if requested < 0 then return requested end\n"
+                    "local r = raster or 1e-5\n"
+                    "if r <= 0 then return requested end\n"
+                    "return math.ceil(requested / r - 1e-12) * r"
+                ),
+            )
+            params[f"{block_path}.seqstar_symbolic_delay"] = _literal(True)
 
     def _apply_symbolic_trapezoid_constructor_bindings(
         self,
@@ -1163,6 +1262,320 @@ class GenericGammaStarDocumentBuilder:
                     ),
                 )
 
+    def _apply_explicit_root_execution_schedule_and_validation(
+        self,
+        *,
+        params: dict[str, Any],
+        sequence_elements: dict[str, str],
+    ) -> None:
+        """Schedule explicit-root execution families from semantic Loop spans."""
+
+        registry = _sequence_node_registry_for_export(self.symbolic_sequence)
+        if not registry:
+            registry = _sequence_node_registry_for_export(self.sequence)
+
+        if "root" not in registry and not any(
+            str(name).startswith("root.")
+            for name in registry
+        ):
+            return
+
+        repeated_nodes: list[tuple[str, Mapping[str, Any]]] = []
+        for name, record in registry.items():
+            if not isinstance(record, Mapping):
+                continue
+            if str(record.get("repeat_mode") or "").lower() != "loop":
+                continue
+            node_name = str(name).strip(".")
+            if node_name.startswith("root."):
+                repeated_nodes.append((node_name, record))
+
+        if not repeated_nodes:
+            return
+
+        records = list(self._block_export_records)
+
+        def gamma_node_path(node_name: str) -> str:
+            return ".".join(
+                _safe_path_token(part)
+                for part in node_name.split(".")
+                if part
+            )
+
+        def matching_block_records(node_name: str) -> list[Mapping[str, Any]]:
+            return [
+                record
+                for record in records
+                if _node_is_within_for_export(
+                    str(record.get("node") or ""),
+                    node_name,
+                )
+            ]
+
+        repeated_paths: dict[str, str] = {}
+
+        for node_name, node_record in repeated_nodes:
+            node_path = gamma_node_path(node_name)
+            if node_path not in sequence_elements:
+                continue
+
+            block_records = matching_block_records(node_name)
+            if not block_records:
+                continue
+
+            first = min(
+                block_records,
+                key=lambda record: float(
+                    record.get("resolved_start", 0.0) or 0.0
+                ),
+            )
+            last = max(
+                block_records,
+                key=lambda record: float(
+                    record.get("resolved_end", 0.0) or 0.0
+                ),
+            )
+            first_path = str(first["path"])
+            last_path = str(last["path"])
+
+            params[f"{node_path}.seqstar_content_duration"] = _expr(
+                inputs={
+                    "first": f"{first_path}.tstart",
+                    "last": f"{last_path}.tend",
+                },
+                script="return last - first",
+            )
+            params[f"{node_path}.seqstar_execution_span"] = _expr(
+                inputs={
+                    "length": f"{node_path}.length",
+                    "period": f"{node_path}.repeat_period",
+                },
+                script="return length * period",
+            )
+            params[f"{node_path}.seqstar_timing_valid"] = _expr(
+                inputs={
+                    "content": f"{node_path}.seqstar_content_duration",
+                    "period": f"{node_path}.repeat_period",
+                },
+                script="return content <= period + 1e-12",
+            )
+
+            test_token = _safe_path_token(node_name.replace(".", "_"))
+            params[
+                f"root.tests.seqstar_repeat_period_valid_{test_token}"
+            ] = _expr(
+                inputs={"ok": f"{node_path}.seqstar_timing_valid"},
+                script="return ok",
+            )
+
+            default_content = (
+                float(last.get("resolved_end", 0.0) or 0.0)
+                - float(first.get("resolved_start", 0.0) or 0.0)
+            )
+            default_period = float(
+                _resolve_repeat_value_for_export(
+                    self.sequence,
+                    node_record.get("repeat_every"),
+                    default=0.0,
+                )
+            )
+            if (
+                default_period > 0.0
+                and default_content > default_period + 1e-12
+            ):
+                # Build a generic block-by-block timing diagnostic from the
+                # resolved representative motif.  This intentionally knows
+                # nothing about PRESS, VAPOR, spectroscopy, or any sequence
+                # family; it reports only concrete SeqStar block timing.
+                ordered_blocks = sorted(
+                    block_records,
+                    key=lambda record: (
+                        float(record.get("resolved_start", 0.0) or 0.0),
+                        int(record.get("index", 0) or 0),
+                    ),
+                )
+
+                diagnostic_lines = [
+                    "gammaSTAR semantic-loop timing validation failed.",
+                    f"node={node_name!r}",
+                    f"content_duration={default_content:.9g} s",
+                    f"repeat_period={default_period:.9g} s",
+                    f"overrun={default_content - default_period:.9g} s",
+                    "",
+                    "Resolved representative-motif block timing:",
+                    (
+                        "  idx | start (s) | end (s)   | dur (s)   | "
+                        "gap_from_prev (s) | local_name | role | node"
+                    ),
+                    (
+                        "  ----+-----------+-----------+-----------+"
+                        "-------------------+------------+------+-----"
+                    ),
+                ]
+
+                previous_end: float | None = None
+                for record in ordered_blocks:
+                    start = float(
+                        record.get("resolved_start", 0.0) or 0.0
+                    )
+                    end = float(
+                        record.get("resolved_end", start) or start
+                    )
+                    duration = float(
+                        record.get("duration", end - start) or 0.0
+                    )
+                    gap = (
+                        0.0
+                        if previous_end is None
+                        else start - previous_end
+                    )
+
+                    block = record.get("block")
+                    role = str(
+                        _block_role(block)
+                        or getattr(block, "role", "")
+                        or ""
+                    )
+                    local_name = str(
+                        record.get("local_name") or ""
+                    )
+                    block_node = str(
+                        record.get("node") or ""
+                    )
+
+                    diagnostic_lines.append(
+                        "  "
+                        f"{int(record.get('index', 0)):>3d} | "
+                        f"{start:>9.6f} | "
+                        f"{end:>9.6f} | "
+                        f"{duration:>9.6f} | "
+                        f"{gap:>17.6f} | "
+                        f"{local_name} | "
+                        f"{role} | "
+                        f"{block_node}"
+                    )
+                    previous_end = max(
+                        end,
+                        previous_end if previous_end is not None else end,
+                    )
+
+                diagnostic_lines.extend(
+                    [
+                        "",
+                        "Interpretation:",
+                        (
+                            "  Positive gap_from_prev means idle time between "
+                            "concrete blocks."
+                        ),
+                        (
+                            "  Negative gap_from_prev means concrete blocks "
+                            "overlap in the resolved representative motif."
+                        ),
+                        (
+                            "  The loop cannot be exported safely while "
+                            "content_duration exceeds repeat_period."
+                        ),
+                    ]
+                )
+
+                raise ValueError("\n".join(diagnostic_lines))
+
+            repeated_paths[node_name] = node_path
+
+        if not repeated_paths:
+            return
+
+        family_to_loops: dict[str, list[str]] = {}
+        for node_name in repeated_paths:
+            parts = node_name.split(".")
+            if len(parts) < 3:
+                continue
+            family_name = ".".join(parts[:2])
+
+            has_repeated_ancestor = any(
+                node_name != other
+                and _node_is_within_for_export(node_name, other)
+                for other in repeated_paths
+            )
+            if has_repeated_ancestor:
+                continue
+
+            family_to_loops.setdefault(family_name, []).append(node_name)
+
+        if not family_to_loops:
+            return
+
+        def family_default_start(family_name: str) -> float:
+            family_records = matching_block_records(family_name)
+            if not family_records:
+                return math.inf
+            return min(
+                float(record.get("resolved_start", 0.0) or 0.0)
+                for record in family_records
+            )
+
+        ordered_families = sorted(
+            family_to_loops,
+            key=family_default_start,
+        )
+
+        for family_name in ordered_families:
+            family_path = gamma_node_path(family_name)
+            loop_names = family_to_loops[family_name]
+            span_inputs = {
+                f"span_{index}": (
+                    f"{repeated_paths[loop_name]}.seqstar_execution_span"
+                )
+                for index, loop_name in enumerate(loop_names)
+            }
+            params[f"{family_path}.seqstar_execution_span"] = _expr(
+                inputs=span_inputs,
+                script="return " + " + ".join(span_inputs),
+            )
+
+        previous_family_path: str | None = None
+        for family_name in ordered_families:
+            family_path = gamma_node_path(family_name)
+
+            if previous_family_path is None:
+                params[f"{family_path}.tstart"] = _literal(0.0)
+            else:
+                params[f"{family_path}.tstart"] = _expr(
+                    inputs={
+                        "previous_start": f"{previous_family_path}.tstart",
+                        "previous_span": (
+                            f"{previous_family_path}.seqstar_execution_span"
+                        ),
+                    },
+                    script="return previous_start + previous_span",
+                )
+
+            params[f"{family_path}.duration"] = _expr(
+                inputs={"span": f"{family_path}.seqstar_execution_span"},
+                script="return span",
+            )
+            params[f"{family_path}.tend"] = _expr(
+                inputs={
+                    "tstart": f"{family_path}.tstart",
+                    "duration": f"{family_path}.duration",
+                },
+                script="return tstart + duration",
+            )
+            previous_family_path = family_path
+
+        if previous_family_path is not None:
+            params["root.duration"] = _expr(
+                inputs={"tend": f"{previous_family_path}.tend"},
+                script="return tend",
+            )
+            params["root.tend"] = _expr(
+                inputs={
+                    "tstart": "root.tstart",
+                    "duration": "root.duration",
+                },
+                script="return tstart + duration",
+            )
+
     def _apply_nested_loop_structure_and_bindings(
         self,
         *,
@@ -1534,7 +1947,7 @@ class GenericGammaStarDocumentBuilder:
                 continue
 
             for target in export_targets:
-                self._write_single_loop_linear_value(
+                self._write_single_loop_variation_value(
                     params=params,
                     path=target,
                     binding=binding,
@@ -1718,7 +2131,7 @@ class GenericGammaStarDocumentBuilder:
         )
 
         varying_value_path = f"{leaf}.{attribute}"
-        self._write_single_loop_linear_value(
+        self._write_single_loop_variation_value(
             params=params,
             path=varying_value_path,
             binding=binding,
@@ -1890,6 +2303,104 @@ class GenericGammaStarDocumentBuilder:
             )
 
         return _to_lua(value)
+
+    def _write_single_loop_variation_value(
+        self,
+        *,
+        params: dict[str, Any],
+        path: str,
+        binding: Mapping[str, Any],
+        counter_path: str,
+    ) -> None:
+        """Write one single-loop variation without changing legacy modes.
+
+        Existing arithmetic variation modes continue to use the established
+        linear writer unchanged.  ``mode='table'`` is the only new branch and
+        selects an explicit value cyclically by the active loop counter.
+        """
+
+        mode = str(binding.get("mode") or "linear").strip().lower()
+
+        if mode == "table":
+            self._write_single_loop_table_value(
+                params=params,
+                path=path,
+                binding=binding,
+                counter_path=counter_path,
+            )
+            return
+
+        self._write_single_loop_linear_value(
+            params=params,
+            path=path,
+            binding=binding,
+            counter_path=counter_path,
+        )
+
+    def _write_single_loop_table_value(
+        self,
+        *,
+        params: dict[str, Any],
+        path: str,
+        binding: Mapping[str, Any],
+        counter_path: str,
+    ) -> None:
+        """Write value = values[counter % len(values)] for gammaSTAR.
+
+        The table is emitted as a literal helper parameter and the backend
+        target remains a live expression of the active loop counter.  This is
+        intentionally generic and does not contain phase-cycling semantics.
+        """
+
+        values = binding.get("values")
+        if values is None:
+            raise ValueError(
+                f"Table variation for {path!r} requires a non-empty values table."
+            )
+
+        try:
+            table = list(values)
+        except TypeError as exc:
+            raise TypeError(
+                f"Table variation values for {path!r} must be iterable."
+            ) from exc
+
+        if not table:
+            raise ValueError(
+                f"Table variation for {path!r} requires at least one value."
+            )
+
+        values_path = f"{path}_variation_values"
+        params[values_path] = _literal(table)
+
+        script = (
+            "local n = #values\n"
+            "if n == 0 then return 0.0 end\n"
+            "local i = ((counter or 0) % n) + 1\n"
+            "local value = values[i]\n"
+        )
+
+        wrap = binding.get("wrap")
+        inputs: dict[str, str] = {
+            "counter": counter_path,
+            "values": values_path,
+        }
+
+        if wrap is not None:
+            wrap_path = f"{path}_variation_wrap"
+            params[wrap_path] = self._variation_scalar_parameter(
+                wrap,
+                fallback=None,
+            )
+            inputs["wrap"] = wrap_path
+            script += (
+                "if wrap ~= nil and wrap ~= 0 then\n"
+                "  value = value % wrap\n"
+                "end\n"
+            )
+
+        script += "return value"
+        params[path] = _expr(inputs=inputs, script=script)
 
     def _write_single_loop_linear_value(
         self,
@@ -2151,11 +2662,44 @@ class GenericGammaStarDocumentBuilder:
 
         block_records: list[dict[str, Any]] = []
         block_start = 0.0
+        used_block_paths: set[str] = set()
+
         for block_index, block in enumerate(export_blocks):
-            node = _block_node_for_export(block, default=f"block_{block_index:03d}")
-            local_name = _block_local_name_for_export(block, node)
-            token = _safe_path_token(node)
-            block_path = f"{kernel_path}.seqstar_blocks.{token}"
+            node = _block_node_for_export(
+                block,
+                default=f"block_{block_index:03d}",
+            )
+            local_name = _block_local_name_for_export(
+                block,
+                node,
+            )
+
+            # ``node`` identifies the semantic hierarchy, but several concrete
+            # blocks may intentionally belong to the same logical node.  The
+            # timing registry therefore needs a concrete-block identity as well
+            # as the logical node identity; otherwise distinct blocks collapse
+            # onto the same ``seqstar_blocks`` path and can create circular
+            # tstart/tend dependencies.
+            node_token = _safe_path_token(node)
+            local_token = _safe_path_token(
+                local_name or f"block_{block_index:03d}"
+            )
+            base_block_path = (
+                f"{kernel_path}.seqstar_blocks."
+                f"{node_token}__{local_token}"
+            )
+            block_path = base_block_path
+
+            # Local names are normally unique within a logical node.  Keep the
+            # mapping collision-safe for arbitrary sequences without imposing
+            # any sequence-specific naming convention.
+            if block_path in used_block_paths:
+                block_path = (
+                    f"{base_block_path}__b{block_index:03d}"
+                )
+
+            used_block_paths.add(block_path)
+
             duration = max(
                 _safe_block_duration(block),
                 _events_extent_duration(list(_iter_events(block))),
@@ -2303,20 +2847,38 @@ class GenericGammaStarDocumentBuilder:
         kernel_path: str,
         exported_events: list[Any],
     ) -> None:
-        """Group events by logical block and rebase child timing correctly.
+        """Group events by logical SeqStar block and preserve node hierarchy.
 
-        gammaSTAR applies parent timing to nested children. Therefore, once an
-        event branch is moved beneath a block group, its public ``tstart`` must
-        become block-local rather than remain kernel-relative.
+        This pass is intentionally sequence-agnostic.  It does not know PRESS,
+        VAPOR, TSE, GRE, EPI, or spectroscopy.  It consumes only generic
+        metadata already attached to blocks/events:
 
-        To preserve cross-block timing relationships, every event container also
-        receives a private ``seqstar_kernel_tstart`` parameter containing its
-        original kernel-relative expression. Relationship dependencies are
-        redirected to that parameter, while plotting uses the rebased local
-        ``tstart``.
+        * source block index;
+        * source block node path, e.g. ``metabolite.vapor``;
+        * source block local name / role;
+        * event-to-block membership.
 
-        This is sequence-agnostic: groups come from block metadata and event
-        membership comes from source block indices.
+        Design contract
+        ---------------
+        SeqStar blocks are timing/grouping scopes, not acquisition loops.
+        However, current gammaSTAR renderers aggregate child plots most reliably
+        when a visual grouping scope has Loop-like timing fields.  Therefore this
+        writer may still emit one-iteration rendering loops for backend display,
+        but those loops are explicitly treated as *rendering containers*, not as
+        semantic SeqStar loops.
+
+        The important generic fixes here are:
+
+        1. preserve dotted node hierarchy exactly when the sequence declares an
+           explicit ``root`` node; otherwise retain the legacy kernel-relative
+           hierarchy for backward compatibility;
+        2. give every visual block container concrete ``tstart`` / ``duration`` /
+           ``tend`` values so gammaSTAR does not show broken ``?`` timing;
+        3. preserve event-local timing by storing the original kernel-relative
+           event start in ``seqstar_kernel_tstart`` and rebasing public
+           ``tstart`` to the block-local scope;
+        4. add Atomic aggregators at block, node, and kernel levels so the
+           gammaSTAR plot panel has plottable content at each useful scope.
         """
 
         if not self._block_export_records or not exported_events:
@@ -2326,45 +2888,478 @@ class GenericGammaStarDocumentBuilder:
         logical_paths: dict[int, str] = {}
         used_paths: set[str] = set(sequence_elements)
 
-        for record in self._block_export_records:
-            block_index = int(record["index"])
+        # Keep track of hierarchy containers and their immediate block children.
+        # These are generic node scopes created from dotted SeqStar node names.
+        node_children: dict[str, list[str]] = {}
+        node_metadata: dict[str, dict[str, Any]] = {}
+        hierarchy_children: dict[str, list[str]] = {}
+        node_registry = _sequence_node_registry_for_export(self.sequence)
+        symbolic_node_registry = _sequence_node_registry_for_export(
+            self.symbolic_sequence
+        )
+
+        def _add_hierarchy_child(parent: str, child: str) -> None:
+            children = hierarchy_children.setdefault(parent, [])
+            if child not in children:
+                children.append(child)
+
+        def _node_record_for_path(node: Any) -> Mapping[str, Any] | None:
+            raw = str(node or "").strip()
+            if not raw:
+                return None
+            record = node_registry.get(raw)
+            if isinstance(record, Mapping):
+                return record
+            return None
+
+        def active_loop_token() -> str | None:
+            parts = kernel_path.split(".")
+            if len(parts) >= 2 and parts[-1] == "kernel":
+                return parts[-2]
+            return None
+
+        outer_token = active_loop_token()
+
+        # When the source hierarchy explicitly declares a top-level ``root``
+        # node, preserve that hierarchy at the gammaSTAR document root rather
+        # than nesting it below the writer's legacy root.average.kernel
+        # staging scope.  This is generic: no acquisition-family or sequence
+        # names are inspected.
+        source_root_mode = (
+            "root" in node_registry
+            or any(
+                str(record.get("node") or "").strip(".") == "root"
+                or str(record.get("node") or "").strip(".").startswith("root.")
+                for record in self._block_export_records
+            )
+        )
+
+        def relative_node_parts(node: Any) -> list[str]:
+            """Return node components relative to the gammaSTAR hierarchy base."""
+
+            raw = str(node or "").strip()
+            if not raw:
+                return []
+            parts = [part for part in raw.split(".") if part]
+
+            if source_root_mode and parts and parts[0] == "root":
+                return parts[1:]
+
+            if outer_token and parts and _safe_path_token(parts[0]) == _safe_path_token(outer_token):
+                parts = parts[1:]
+            return parts
+
+        def ensure_render_container(
+            path: str,
+            *,
+            node: Any = None,
+            role: Any = None,
+            container_kind: str = "seqstar_node",
+        ) -> None:
+            """Create the gammaSTAR container matching SeqStar semantics.
+
+            Container selection is based only on execution semantics:
+
+            * a logical node with ``repeat_mode="loop"`` becomes a gammaSTAR
+              ``Loop``;
+            * a logical node without repetition becomes a generic gammaSTAR
+              composite kernel container;
+            * a concrete SeqStar block without repetition also becomes a generic
+              gammaSTAR composite kernel container.
+
+            Ordinary blocks are therefore not represented as artificial
+            one-iteration Loops. Their existing block-level Atomic child remains
+            responsible for rendering RF/gradient/ADC primitives.
+
+            This rule is sequence-agnostic and does not inspect sequence names,
+            node names, block roles, or event types.
+            """
+
+            node_record = _node_record_for_path(node)
+            repeat_count_ref = None
+            repeat_every_ref = None
+            repeat_mode = ""
+            if node_record is not None:
+                repeat_count_ref = node_record.get("repeat_count")
+                repeat_every_ref = node_record.get("repeat_every")
+                repeat_mode = str(node_record.get("repeat_mode") or "").lower()
+
+            symbolic_record = symbolic_node_registry.get(str(node or "").strip())
+            if isinstance(symbolic_record, Mapping):
+                if _protocol_source_name_from_value(
+                    repeat_count_ref,
+                    self._live_protocol_values,
+                ) is None:
+                    symbolic_count = symbolic_record.get("repeat_count")
+                    if symbolic_count is not None:
+                        repeat_count_ref = symbolic_count
+
+                if _protocol_source_name_from_value(
+                    repeat_every_ref,
+                    self._live_protocol_values,
+                ) is None:
+                    symbolic_period = symbolic_record.get("repeat_every")
+                    if symbolic_period is not None:
+                        repeat_every_ref = symbolic_period
+
+                if not repeat_mode:
+                    repeat_mode = str(
+                        symbolic_record.get("repeat_mode") or ""
+                    ).lower()
+
+            is_logical_node = container_kind == "seqstar_node_container"
+            is_semantic_loop = (
+                is_logical_node
+                and repeat_mode == "loop"
+                and (repeat_count_ref is not None or repeat_every_ref is not None)
+            )
+
+            if path not in sequence_elements:
+                if is_semantic_loop:
+                    sequence_elements[path] = "Loop"
+                else:
+                    sequence_elements[path] = KERNEL_BLUEPRINT
+
+            if is_semantic_loop:
+                params.setdefault(f"{path}.counter", _literal(0))
+
+                count_source = _protocol_source_name_from_value(
+                    repeat_count_ref,
+                    self._live_protocol_values,
+                )
+                if count_source is not None:
+                    params[f"{path}.length"] = _expr(
+                        inputs={"count": f"root.prot.{_protocol_key(count_source)}"},
+                        script="return count",
+                    )
+                else:
+                    params[f"{path}.length"] = _literal(
+                        int(round(float(_resolve_repeat_value_for_export(
+                            self.sequence,
+                            repeat_count_ref,
+                            default=1,
+                        ))))
+                    )
+
+                period_source = _protocol_source_name_from_value(
+                    repeat_every_ref,
+                    self._live_protocol_values,
+                )
+                if period_source is not None:
+                    params[f"{path}.repeat_period"] = _expr(
+                        inputs={"period": f"root.prot.{_protocol_key(period_source)}"},
+                        script="return period",
+                    )
+                elif repeat_every_ref is not None:
+                    params[f"{path}.repeat_period"] = _literal(
+                        float(_resolve_repeat_value_for_export(
+                            self.sequence,
+                            repeat_every_ref,
+                            default=0.0,
+                        ))
+                    )
+
+                # A gammaSTAR Loop is positioned by its own counter and period.
+                # This relationship is generic for every SeqStar semantic loop.
+                if f"{path}.repeat_period" in params:
+                    params[f"{path}.tstart"] = _expr(
+                        inputs={
+                            "counter": f"{path}.counter",
+                            "period": f"{path}.repeat_period",
+                        },
+                        script="return counter * period",
+                    )
+                    params[f"{path}.duration"] = _expr(
+                        inputs={"period": f"{path}.repeat_period"},
+                        script="return period",
+                    )
+                    params[f"{path}.tend"] = _expr(
+                        inputs={
+                            "tstart": f"{path}.tstart",
+                            "duration": f"{path}.duration",
+                        },
+                        script="return tstart + duration",
+                    )
+
+                params[f"{path}.seqstar_semantic_loop"] = _literal(True)
+            else:
+                params.setdefault(f"{path}.seqstar_semantic_loop", _literal(False))
+
+            if node is not None:
+                params.setdefault(f"{path}.node", _literal(node))
+            if role is not None:
+                params.setdefault(f"{path}.role", _literal(role))
+            params.setdefault(f"{path}.seqstar_container_kind", _literal(container_kind))
+
+        def local_block_name(record: Mapping[str, Any], block_index: int) -> str:
             local_name = (
                 record.get("local_name")
                 or str(record.get("node") or f"block_{block_index:03d}").rsplit(".", 1)[-1]
             )
-            group_path = f"{kernel_path}.{_safe_path_token(local_name)}"
+            local_name = str(local_name or f"block_{block_index:03d}")
+
+            # If a developer used fully qualified block names such as
+            # metabolite_press_rf1 under node metabolite.press, strip the node
+            # prefix only for the gammaSTAR visual hierarchy.  The original name
+            # remains in diagnostics/metadata.
+            node = str(record.get("node") or "")
+            candidates = []
+            if node:
+                candidates.append(_safe_path_token(node.replace(".", "_")) + "_")
+            if outer_token:
+                candidates.append(_safe_path_token(str(outer_token)) + "_")
+            safe_local = _safe_path_token(local_name)
+            for prefix in candidates:
+                if safe_local.startswith(prefix) and len(safe_local) > len(prefix):
+                    return safe_local[len(prefix):]
+            return safe_local
+
+        # ------------------------------------------------------------------
+        # 1. Build a visible hierarchy that mirrors generic SeqStar node paths.
+        # ------------------------------------------------------------------
+        #
+        # gammaSTAR interprets child ``tstart`` values in the coordinate system
+        # of their immediate parent. SeqStar block records, however, carry
+        # resolved starts in the flattened kernel coordinate system. Build the
+        # absolute extent of every logical node first so each node/block can be
+        # rebased exactly once into its parent-local coordinate system.
+        #
+        # This is sequence-agnostic: the calculation uses only dotted node paths
+        # and resolved block timing.
+        node_absolute_extents: dict[str, tuple[float, float]] = {}
+
+        for extent_record in self._block_export_records:
+            extent_node = extent_record.get("node")
+            extent_parts = relative_node_parts(extent_node)
+            if not extent_parts:
+                continue
+
+            extent_start = float(
+                extent_record.get("resolved_start", 0.0) or 0.0
+            )
+            extent_duration = float(
+                extent_record.get("duration", 0.0) or 0.0
+            )
+            extent_end = extent_start + extent_duration
+
+            extent_parent = "root" if source_root_mode else kernel_path
+            for extent_part in extent_parts:
+                extent_path = (
+                    f"{extent_parent}.{_safe_path_token(extent_part)}"
+                )
+                previous_extent = node_absolute_extents.get(extent_path)
+                if previous_extent is None:
+                    node_absolute_extents[extent_path] = (
+                        extent_start,
+                        extent_end,
+                    )
+                else:
+                    node_absolute_extents[extent_path] = (
+                        min(previous_extent[0], extent_start),
+                        max(previous_extent[1], extent_end),
+                    )
+                extent_parent = extent_path
+
+        # Map each logical hierarchy node to its first/last concrete timing
+        # record. These paths remain live when symbolic block durations change.
+        node_first_block_path: dict[str, str] = {}
+        node_last_block_path: dict[str, str] = {}
+
+        if source_root_mode:
+            for timing_record in self._block_export_records:
+                timing_node = timing_record.get("node")
+                timing_parts = relative_node_parts(timing_node)
+                if not timing_parts:
+                    continue
+
+                timing_parent = "root"
+                logical_block_path = str(timing_record["path"])
+                for timing_part in timing_parts:
+                    timing_parent = (
+                        f"{timing_parent}.{_safe_path_token(timing_part)}"
+                    )
+                    node_first_block_path.setdefault(
+                        timing_parent,
+                        logical_block_path,
+                    )
+                    node_last_block_path[timing_parent] = logical_block_path
+
+        for record in self._block_export_records:
+            block_index = int(record["index"])
+            node = record.get("node")
+            node_parts = relative_node_parts(node)
+
+            parent_path = "root" if source_root_mode else kernel_path
+            cumulative_node_parts: list[str] = ["root"] if source_root_mode else []
+            for part in node_parts:
+                cumulative_node_parts.append(part)
+                child_path = f"{parent_path}.{_safe_path_token(part)}"
+                child_node_name = ".".join(cumulative_node_parts)
+                ensure_render_container(
+                    child_path,
+                    node=child_node_name,
+                    role="seqstar_node",
+                    container_kind="seqstar_node_container",
+                )
+                _add_hierarchy_child(parent_path, child_path)
+                node_metadata.setdefault(
+                    child_path,
+                    {
+                        "node": child_node_name,
+                        "role": "seqstar_node",
+                    },
+                )
+                parent_path = child_path
+
+            block_token = local_block_name(record, block_index)
+            group_path = f"{parent_path}.{block_token}"
             if group_path in used_paths:
                 group_path = f"{group_path}_{block_index:03d}"
-
             used_paths.add(group_path)
+
             group_paths[block_index] = group_path
             logical_path = str(record["path"])
             logical_paths[block_index] = logical_path
 
-            # One-iteration Loop gives gammaSTAR a real aggregating scope.
-            sequence_elements[group_path] = "Loop"
-            params[f"{group_path}.counter"] = _literal(0)
-            params[f"{group_path}.length"] = _literal(1)
-            params[f"{group_path}.tstart"] = _expr(
-                inputs={"block_tstart": f"{logical_path}.tstart"},
-                script="return block_tstart",
-            )
-            params[f"{group_path}.duration"] = _expr(
-                inputs={"block_duration": f"{logical_path}.duration"},
-                script="return block_duration",
-            )
-            params[f"{group_path}.tend"] = _expr(
-                inputs={
-                    "tstart": f"{group_path}.tstart",
-                    "duration": f"{group_path}.duration",
-                },
-                script="return tstart + duration",
-            )
-            params[f"{group_path}.node"] = _literal(record.get("node"))
-            params[f"{group_path}.role"] = _literal(
-                _block_role(record["block"]) or record.get("local_name")
+            ensure_render_container(
+                group_path,
+                node=record.get("node"),
+                role=_block_role(record["block"]) or record.get("local_name"),
+                container_kind="seqstar_block_container",
             )
 
+            # Keep resolved timing for diagnostics, but in explicit-root mode
+            # drive the public block scope from the live logical timing table.
+            # This is what lets any protocol-driven symbolic delay move all
+            # downstream blocks interactively.
+            resolved_tstart = float(record.get("resolved_start", 0.0) or 0.0)
+            resolved_duration = float(record.get("duration", 0.0) or 0.0)
+
+            if source_root_mode and parent_path in node_first_block_path:
+                parent_first_path = node_first_block_path[parent_path]
+                params[f"{group_path}.tstart"] = _expr(
+                    inputs={
+                        "block_tstart": f"{logical_path}.tstart",
+                        "parent_tstart": f"{parent_first_path}.tstart",
+                    },
+                    script="return block_tstart - parent_tstart",
+                )
+                params[f"{group_path}.duration"] = _expr(
+                    inputs={"duration": f"{logical_path}.duration"},
+                    script="return duration",
+                )
+                params[f"{group_path}.tend"] = _expr(
+                    inputs={
+                        "tstart": f"{group_path}.tstart",
+                        "duration": f"{group_path}.duration",
+                    },
+                    script="return tstart + duration",
+                )
+                params[f"{group_path}.seqstar_kernel_tstart"] = _expr(
+                    inputs={"tstart": f"{logical_path}.tstart"},
+                    script="return tstart",
+                )
+            else:
+                parent_absolute_start = 0.0
+                if source_root_mode:
+                    parent_extent = node_absolute_extents.get(parent_path)
+                    if parent_extent is not None:
+                        parent_absolute_start = float(parent_extent[0])
+                local_tstart = resolved_tstart - parent_absolute_start
+                params[f"{group_path}.tstart"] = _literal(local_tstart)
+                params[f"{group_path}.duration"] = _literal(resolved_duration)
+                params[f"{group_path}.tend"] = _literal(
+                    local_tstart + resolved_duration
+                )
+                params[f"{group_path}.seqstar_kernel_tstart"] = _literal(
+                    resolved_tstart
+                )
+
+            params[f"{group_path}.seqstar_logical_block_path"] = _literal(
+                logical_path
+            )
+            params[f"{group_path}.seqstar_resolved_tstart"] = _literal(
+                resolved_tstart
+            )
+            params[f"{group_path}.seqstar_resolved_duration"] = _literal(
+                resolved_duration
+            )
+
+            node_children.setdefault(parent_path, []).append(group_path)
+            _add_hierarchy_child(parent_path, group_path)
+
+        # Give every non-loop logical node a live parent-local timing scope from
+        # its first/last concrete block. Semantic Loop timing was already defined
+        # from counter * repeat_period above and must not be overwritten here.
+        if source_root_mode:
+            node_paths_by_depth = sorted(
+                node_absolute_extents,
+                key=lambda path: path.count("."),
+            )
+            for node_path in node_paths_by_depth:
+                absolute_start, absolute_end = node_absolute_extents[node_path]
+
+                semantic_loop_param = params.get(
+                    f"{node_path}.seqstar_semantic_loop"
+                )
+                semantic_loop = False
+                if isinstance(semantic_loop_param, Mapping):
+                    semantic_loop = "return true" in str(
+                        semantic_loop_param.get("script", "")
+                    ).lower()
+
+                if not semantic_loop:
+                    first_path = node_first_block_path.get(node_path)
+                    last_path = node_last_block_path.get(node_path)
+                    parent_node_path = node_path.rsplit(".", 1)[0]
+                    parent_first_path = node_first_block_path.get(
+                        parent_node_path
+                    )
+
+                    if first_path and last_path:
+                        if parent_first_path:
+                            params[f"{node_path}.tstart"] = _expr(
+                                inputs={
+                                    "first": f"{first_path}.tstart",
+                                    "parent_first": (
+                                        f"{parent_first_path}.tstart"
+                                    ),
+                                },
+                                script="return first - parent_first",
+                            )
+                        else:
+                            params[f"{node_path}.tstart"] = _expr(
+                                inputs={"first": f"{first_path}.tstart"},
+                                script="return first",
+                            )
+
+                        params[f"{node_path}.duration"] = _expr(
+                            inputs={
+                                "first": f"{first_path}.tstart",
+                                "last": f"{last_path}.tend",
+                            },
+                            script="return last - first",
+                        )
+                        params[f"{node_path}.tend"] = _expr(
+                            inputs={
+                                "tstart": f"{node_path}.tstart",
+                                "duration": f"{node_path}.duration",
+                            },
+                            script="return tstart + duration",
+                        )
+
+                # Preserve numeric source extents for diagnostics regardless of
+                # whether the public timing is live or loop-driven.
+                params[f"{node_path}.seqstar_resolved_tstart"] = _literal(
+                    float(absolute_start)
+                )
+                params[f"{node_path}.seqstar_resolved_tend"] = _literal(
+                    float(absolute_end)
+                )
+
+        # ------------------------------------------------------------------
+        # 2. Move event branches under their source block containers.
+        # ------------------------------------------------------------------
         prefix_map: dict[str, str] = {}
         old_group_by_container: dict[str, str] = {}
         event_by_old_container: dict[str, Any] = {}
@@ -2383,11 +3378,8 @@ class GenericGammaStarDocumentBuilder:
             #   <readout_loop>.single_readout.atomic
             #   <readout_loop>.single_readout.adc
             #
-            # The event-container registry points to ``single_readout``. When
-            # grouping by source block, move the complete readout Loop ancestor,
-            # not only the SingleReadout child. Otherwise ``windows``,
-            # ``window_data``, and ``counter`` remain orphaned at the old path
-            # and gammaSTAR can render only one/default ADC window.
+            # The registry points to single_readout.  Move the complete readout
+            # Loop ancestor so windows/window_data/counter remain attached.
             if _is_adc_event(event) and _has_multiple_adc_windows_for_export(event):
                 if old_container.endswith(".single_readout"):
                     old_container = old_container.rsplit(".", 1)[0]
@@ -2414,9 +3406,11 @@ class GenericGammaStarDocumentBuilder:
             params[tstart_key] = _expr(
                 inputs={
                     "kernel_tstart": f"{old_container}.seqstar_kernel_tstart",
-                    "group_tstart": f"{group_path}.tstart",
+                    "group_absolute_tstart": (
+                        f"{group_path}.seqstar_kernel_tstart"
+                    ),
                 },
-                script="return kernel_tstart - group_tstart",
+                script="return kernel_tstart - group_absolute_tstart",
             )
 
         ordered_prefixes = sorted(prefix_map, key=len, reverse=True)
@@ -2489,38 +3483,10 @@ class GenericGammaStarDocumentBuilder:
                         continue
                     fixed = dict(param)
                     inputs = dict(fixed.get("inputs", {}))
-                    # Add the block-group start without discarding timing
-                    # levels already present in the Atomic expression.
-                    #
-                    # A simple event normally has:
-                    #
-                    #   t0 + t1 + t2 + t3
-                    #
-                    # A nested event such as a multi-window ADC may have:
-                    #
-                    #   t0 + t1 + t2 + t3 + t4
-                    #
-                    # where t3 is the train/loop iteration start and t4 is the
-                    # SingleReadout-local start. The previous grouping rewrite
-                    # replaced the expression with a fixed four-level formula
-                    # and silently dropped t4. Preserve every existing numeric
-                    # timing input and insert only the new group parent.
-                    inputs["group_tstart"] = f"{group_path}.tstart"
+                    inputs["group_tstart"] = (
+                        f"{group_path}.seqstar_kernel_tstart"
+                    )
 
-                    # Atomic plotting timing must consume the grouped event's
-                    # public block-local tstart. The private
-                    # ``seqstar_kernel_tstart`` exists only for cross-event
-                    # relationship calculations. Using that private value here
-                    # and also adding ``group_tstart`` double-counts the block
-                    # offset.
-                    #
-                    # Replace every private kernel-relative timing input within
-                    # this moved event branch by its corresponding public local
-                    # tstart. This also handles nested branches such as:
-                    #
-                    #   readout Loop -> SingleReadout -> Atomic
-                    #
-                    # without any sequence-specific path checks.
                     for input_name, input_path in list(inputs.items()):
                         suffix = ".seqstar_kernel_tstart"
                         if str(input_path).endswith(suffix):
@@ -2531,36 +3497,21 @@ class GenericGammaStarDocumentBuilder:
                     timing_terms = [
                         name
                         for name in inputs
-                        if (
-                            name.startswith("t")
-                            and name[1:].isdigit()
-                        )
+                        if name.startswith("t") and name[1:].isdigit()
                     ]
-                    timing_terms.sort(
-                        key=lambda name: int(name[1:])
-                    )
+                    timing_terms.sort(key=lambda name: int(name[1:]))
 
                     sum_terms = timing_terms[:3]
                     sum_terms.append("group_tstart")
                     sum_terms.extend(timing_terms[3:])
 
                     fixed["inputs"] = inputs
-                    fixed["script"] = (
-                        "return " + " + ".join(sum_terms)
-                    )
+                    fixed["script"] = "return " + " + ".join(sum_terms)
                     params[key] = fixed
 
-        # Add one Atomic aggregator directly beneath each block group.
-        #
-        # Important gammaSTAR compatibility rule:
-        # Build the block Atomic directly from each contained event's
-        # ``basic_repr_*`` and ``basic_repr_*_tstart_relative`` parameters.
-        # This mirrors native gammaSTAR sequence JSON such as FLASH.
-        #
-        # Do not dynamically merge child ``full_basic_repr_*`` tables with Lua
-        # ``pairs`` loops. Although valid Lua, that pattern is not evaluated
-        # reliably by all gammaSTAR workplace aggregation paths and can leave a
-        # group visually empty even though its child event leaves exist.
+        # ------------------------------------------------------------------
+        # 3. Add Atomic aggregators for every block container.
+        # ------------------------------------------------------------------
         containers_by_group: dict[str, list[tuple[str, Any]]] = {}
 
         for old_container, new_container in prefix_map.items():
@@ -2568,23 +3519,87 @@ class GenericGammaStarDocumentBuilder:
             event = event_by_old_container.get(old_container)
             if event is None:
                 continue
-            containers_by_group.setdefault(group_path, []).append(
-                (new_container, event)
+            containers_by_group.setdefault(group_path, []).append((new_container, event))
+
+        block_atomic_paths: list[str] = []
+
+        def add_atomic_aggregate(
+            aggregate_path: str,
+            sources: list[dict[str, str]],
+            *,
+            tstart_inputs: dict[str, str] | None = None,
+            tstart_script: str | None = None,
+        ) -> None:
+            """Create an Atomic table by explicitly aggregating child atomics."""
+
+            sequence_elements[aggregate_path] = "Atomic"
+            if tstart_inputs is None:
+                tstart_inputs = {
+                    "t0": "root.tstart",
+                    "t1": f"{self._active_loop_path}.tstart",
+                    "t2": f"{kernel_path}.tstart",
+                }
+                tstart_script = "return t0 + t1 + t2"
+            params[f"{aggregate_path}.tstart_absolute"] = _expr(
+                inputs=tstart_inputs,
+                script=tstart_script or "return 0.0",
+            )
+
+            for category, field_name in (
+                ("GradPulse", "full_basic_repr_GradPulse"),
+                ("RFPulse", "full_basic_repr_RFPulse"),
+                ("ADC", "full_basic_repr_ADC"),
+                ("TriggerPulse", "full_basic_repr_TriggerPulse"),
+            ):
+                inputs: dict[str, str] = {}
+                table_lines: list[str] = ["return {"]
+                count = 0
+                for index, source in enumerate(sources):
+                    repr_path = source.get(f"repr_{category}")
+                    if not repr_path:
+                        continue
+                    repr_name = f"repr_{index}"
+                    tstart_name = f"tstart_{index}"
+                    inputs[repr_name] = repr_path
+                    inputs[tstart_name] = source["tstart"]
+                    table_lines.append(
+                        f"['{source['key']}']={{"
+                        f"tstart_relative={tstart_name}, "
+                        f"required_parameters={repr_name}"
+                        "},"
+                    )
+                    count += 1
+                table_lines.append("}")
+                if count == 0:
+                    params[f"{aggregate_path}.{field_name}"] = _expr(
+                        inputs={},
+                        script="return {}",
+                    )
+                else:
+                    params[f"{aggregate_path}.{field_name}"] = _expr(
+                        inputs=inputs,
+                        script="\n".join(table_lines),
+                    )
+
+            params[f"{aggregate_path}.full_basic_repr"] = _expr(
+                inputs={
+                    "full_basic_repr_TriggerPulse": f"{aggregate_path}.full_basic_repr_TriggerPulse",
+                    "full_basic_repr_ADC": f"{aggregate_path}.full_basic_repr_ADC",
+                    "full_basic_repr_RFPulse": f"{aggregate_path}.full_basic_repr_RFPulse",
+                    "full_basic_repr_GradPulse": f"{aggregate_path}.full_basic_repr_GradPulse",
+                },
+                script=(
+                    "return {\n"
+                    "GradPulse=full_basic_repr_GradPulse,\n"
+                    "RFPulse=full_basic_repr_RFPulse,\n"
+                    "ADC=full_basic_repr_ADC,\n"
+                    "TriggerPulse=full_basic_repr_TriggerPulse\n"
+                    "}"
+                ),
             )
 
         for group_path, container_events in containers_by_group.items():
-            # A block containing exactly one multi-window ADC train plus one or
-            # more concurrent, regularly segmented gradients is lowered as one
-            # repeated gammaSTAR readout cycle:
-            #
-            #   group
-            #     readout Loop
-            #       single_readout
-            #         Atomic: gradient segment(s) + ADC window
-            #
-            # The source SeqStar timeline remains compact. No sequence name,
-            # trajectory name, node name, or developer-facing export flag is
-            # required.
+            # Preserve specialized compact train lowering where applicable.
             if self._lower_implicit_synchronized_train_group(
                 params=params,
                 sequence_elements=sequence_elements,
@@ -2594,17 +3609,7 @@ class GenericGammaStarDocumentBuilder:
                 continue
 
             group_atomic = f"{group_path}.atomic"
-            sequence_elements[group_atomic] = "Atomic"
-
-            params[f"{group_atomic}.tstart_absolute"] = _expr(
-                inputs={
-                    "t0": "root.tstart",
-                    "t1": f"{self._active_loop_path}.tstart",
-                    "t2": f"{kernel_path}.tstart",
-                    "t3": f"{group_path}.tstart",
-                },
-                script="return t0 + t1 + t2 + t3",
-            )
+            block_atomic_paths.append(group_atomic)
 
             category_entries: dict[str, list[dict[str, str]]] = {
                 "GradPulse": [],
@@ -2615,9 +3620,7 @@ class GenericGammaStarDocumentBuilder:
             adc_train_entries: list[dict[str, str]] = []
 
             for container, event in container_events:
-                event_key = _safe_path_token(
-                    container.rsplit(".", 1)[-1]
-                )
+                event_key = _safe_path_token(container.rsplit(".", 1)[-1])
 
                 if _is_gradient_event(event):
                     category = "GradPulse"
@@ -2629,49 +3632,42 @@ class GenericGammaStarDocumentBuilder:
                     repr_container = container
                 elif _is_adc_event(event):
                     if _has_multiple_adc_windows_for_export(event):
-                        # Preserve the nested editable hierarchy:
-                        #
-                        #   readout Loop -> single_readout -> ADC
-                        #
-                        # and separately expose all windows to the parent block
-                        # Atomic for plotting. The parent representation is
-                        # generated from the generic window table and does not
-                        # alter loop timing, dead-time policy, or child nodes.
                         adc_train_entries.append(
                             {
                                 "event_key": event_key,
                                 "windows_path": f"{container}.windows",
-                                "repr_path": (
-                                    f"{container}.single_readout.atomic."
-                                    "basic_repr_adc"
-                                ),
-                                "num_windows": len(
-                                    _get_adc_windows_for_export(event)
-                                ),
+                                "repr_path": f"{container}.single_readout.atomic.basic_repr_adc",
+                                "num_windows": len(_get_adc_windows_for_export(event)),
                             }
                         )
                         continue
-
                     category = "ADC"
                     basic_name = "adc"
                     repr_container = container
                 else:
-                    # Unsupported event families are intentionally omitted from
-                    # the Atomic representation rather than guessed.
                     continue
 
                 category_entries[category].append(
                     {
                         "event_key": event_key,
-                        "repr_path": (
-                            f"{repr_container}.atomic.basic_repr_{basic_name}"
-                        ),
+                        "repr_path": f"{repr_container}.atomic.basic_repr_{basic_name}",
                         "tstart_path": (
                             f"{repr_container}.atomic."
                             f"basic_repr_{basic_name}_tstart_relative"
                         ),
                     }
                 )
+
+            sequence_elements[group_atomic] = "Atomic"
+            params[f"{group_atomic}.tstart_absolute"] = _expr(
+                inputs={
+                    "t0": "root.tstart",
+                    "t1": f"{self._active_loop_path}.tstart",
+                    "t2": f"{kernel_path}.tstart",
+                    "t3": f"{group_path}.seqstar_kernel_tstart",
+                },
+                script="return t0 + t1 + t2 + t3",
+            )
 
             for category, field_name in (
                 ("GradPulse", "full_basic_repr_GradPulse"),
@@ -2683,11 +3679,7 @@ class GenericGammaStarDocumentBuilder:
 
                 if category == "ADC" and adc_train_entries:
                     inputs: dict[str, str] = {}
-                    script_lines: list[str] = [
-                        "local result = {}",
-                    ]
-
-                    # Preserve ordinary single-window ADC entries, if any.
+                    script_lines: list[str] = ["local result = {}"]
                     for index, entry in enumerate(entries):
                         repr_name = f"basic_repr_{index}"
                         tstart_name = f"basic_tstart_{index}"
@@ -2702,26 +3694,14 @@ class GenericGammaStarDocumentBuilder:
                             + repr_name
                             + "}"
                         )
-
-                    # Add every window from each compact ADC train to the
-                    # parent Atomic using statically enumerated keys.
-                    #
-                    # gammaSTAR reliably evaluates explicit Atomic tables, while
-                    # runtime-generated table keys from Lua loops are not
-                    # consistently propagated into parent plots. The nested
-                    # readout Loop remains authoritative for editing and timing;
-                    # this static table is only a parent-plot projection.
                     for train_index, train in enumerate(adc_train_entries):
                         windows_name = f"windows_{train_index}"
                         repr_name = f"train_repr_{train_index}"
                         inputs[windows_name] = train["windows_path"]
                         inputs[repr_name] = train["repr_path"]
-
                         for window_index in range(int(train["num_windows"])):
                             lua_index = window_index + 1
-                            key = (
-                                f"{train['event_key']}_window_{window_index}"
-                            )
+                            key = f"{train['event_key']}_window_{window_index}"
                             script_lines.append(
                                 "result['"
                                 + key
@@ -2734,9 +3714,7 @@ class GenericGammaStarDocumentBuilder:
                                 + f"required_parameters={repr_name}"
                                 + "}"
                             )
-
                     script_lines.append("return result")
-
                     params[f"{group_atomic}.{field_name}"] = _expr(
                         inputs=inputs,
                         script="\n".join(script_lines),
@@ -2752,23 +3730,18 @@ class GenericGammaStarDocumentBuilder:
 
                 inputs: dict[str, str] = {}
                 table_lines: list[str] = ["return {"]
-
                 for index, entry in enumerate(entries):
                     repr_name = f"basic_repr_{index}"
                     tstart_name = f"basic_tstart_{index}"
-
                     inputs[repr_name] = entry["repr_path"]
                     inputs[tstart_name] = entry["tstart_path"]
-
                     table_lines.append(
                         f"['{entry['event_key']}']={{"
                         f"tstart_relative={tstart_name}, "
                         f"required_parameters={repr_name}"
                         "},"
                     )
-
                 table_lines.append("}")
-
                 params[f"{group_atomic}.{field_name}"] = _expr(
                     inputs=inputs,
                     script="\n".join(table_lines),
@@ -2776,18 +3749,10 @@ class GenericGammaStarDocumentBuilder:
 
             params[f"{group_atomic}.full_basic_repr"] = _expr(
                 inputs={
-                    "full_basic_repr_TriggerPulse": (
-                        f"{group_atomic}.full_basic_repr_TriggerPulse"
-                    ),
-                    "full_basic_repr_ADC": (
-                        f"{group_atomic}.full_basic_repr_ADC"
-                    ),
-                    "full_basic_repr_RFPulse": (
-                        f"{group_atomic}.full_basic_repr_RFPulse"
-                    ),
-                    "full_basic_repr_GradPulse": (
-                        f"{group_atomic}.full_basic_repr_GradPulse"
-                    ),
+                    "full_basic_repr_TriggerPulse": f"{group_atomic}.full_basic_repr_TriggerPulse",
+                    "full_basic_repr_ADC": f"{group_atomic}.full_basic_repr_ADC",
+                    "full_basic_repr_RFPulse": f"{group_atomic}.full_basic_repr_RFPulse",
+                    "full_basic_repr_GradPulse": f"{group_atomic}.full_basic_repr_GradPulse",
                 },
                 script=(
                     "return {\n"
@@ -2799,26 +3764,355 @@ class GenericGammaStarDocumentBuilder:
                 ),
             )
 
+        # ------------------------------------------------------------------
+        # 4. Aggregate block atomics recursively into node atomics and kernel atomics.
+        # ------------------------------------------------------------------
+        # hierarchy_children records the visible tree we created above:
+        #
+        #   kernel
+        #     metabolite
+        #       vapor
+        #         pulse_1
+        #       press
+        #         rf1
+        #     water_reference
+        #       press
+        #
+        # Build Atomic aggregators bottom-up so a high-level node gets the sum of
+        # all descendants, not only its immediate block children.
+        group_order: dict[str, int] = {
+            group_path: int(block_index)
+            for block_index, group_path in group_paths.items()
+        }
+
+        aggregate_atomic_paths: list[str] = []
+
+        def _hierarchy_sort_key(path: str) -> tuple[int, int, str]:
+            descendants = [
+                group_order.get(child, 10**9)
+                for child in hierarchy_children.get(path, [])
+            ]
+            first = min(descendants) if descendants else group_order.get(path, 10**9)
+            return (first, path.count("."), path)
+
+        # Parents deepest first; this lets kernel.metabolite aggregate from
+        # kernel.metabolite.vapor.atomic and kernel.metabolite.press.atomic after
+        # those child node atomics have been created.
+        parents = sorted(
+            hierarchy_children,
+            key=lambda path: (path.count("."), _hierarchy_sort_key(path)),
+            reverse=True,
+        )
+
+        for parent_path in parents:
+            if source_root_mode and parent_path == "root":
+                # ``root`` is the gammaSTAR document root blueprint, not a
+                # render-container Loop.  Its declared SeqStar children are
+                # preserved directly beneath it.
+                continue
+
+            if parent_path not in sequence_elements:
+                # kernel_path itself is already present; this also permits future
+                # non-sequence-element bookkeeping parents to be ignored safely.
+                continue
+
+            children = [
+                child for child in hierarchy_children.get(parent_path, [])
+                if child in sequence_elements
+            ]
+            if not children:
+                continue
+            children = sorted(children, key=_hierarchy_sort_key)
+
+            # In explicit source-root mode, logical-node timing has already
+            # been computed from descendant block min/max extents and rebased
+            # to the immediate parent. Do not replace it with first/last-child
+            # ordering, which is neither temporal nor hierarchy-safe.
+            if not (
+                source_root_mode
+                and parent_path in node_absolute_extents
+            ):
+                first_child = children[0]
+                last_child = children[-1]
+                params[f"{parent_path}.tstart"] = _expr(
+                    inputs={"first": f"{first_child}.tstart"},
+                    script="return first",
+                )
+                params[f"{parent_path}.tend"] = _expr(
+                    inputs={"last": f"{last_child}.tend"},
+                    script="return last",
+                )
+                params[f"{parent_path}.duration"] = _expr(
+                    inputs={
+                        "tstart": f"{parent_path}.tstart",
+                        "tend": f"{parent_path}.tend",
+                    },
+                    script="return tend - tstart",
+                )
+
+            # In explicit root-based hierarchy mode, logical SeqStar nodes are
+            # native gammaSTAR containers:
+            #
+            #   semantic repeated node -> Loop
+            #   ordinary logical node  -> KERNEL_BLUEPRINT
+            #
+            # Their child sequence elements provide composition directly.
+            # Do not create a synthetic node-level Atomic that flattens several
+            # distinct child RF/gradient/ADC events into one representation.
+            if (
+                source_root_mode
+                and parent_path in node_absolute_extents
+            ):
+                continue
+
+            aggregate_sources: list[dict[str, str]] = []
+
+            if (
+                source_root_mode
+                and parent_path in node_absolute_extents
+            ):
+                # In explicit SeqStar hierarchy mode, a logical node's Atomic
+                # representation should contain primitive descendant events
+                # directly. Do not recursively embed child full_basic_repr
+                # dictionaries as required_parameters.
+                #
+                # The visible SeqStar hierarchy is still preserved separately;
+                # this flattening applies only to the node's render-time Atomic
+                # representation.
+                aggregate_atomic = f"{parent_path}.atomic"
+                parent_absolute_start = (
+                    f"{parent_path}.seqstar_resolved_tstart"
+                )
+
+                flat_index = 0
+                used_flat_keys: set[str] = set()
+
+                for old_container, new_container in prefix_map.items():
+                    if not new_container.startswith(parent_path + "."):
+                        continue
+
+                    event = event_by_old_container.get(old_container)
+                    if event is None:
+                        continue
+
+                    # Multi-window ADC trains retain their established
+                    # specialized lowering. If a node contains only such
+                    # constructs, the recursive fallback below preserves them.
+                    if (
+                        _is_adc_event(event)
+                        and _has_multiple_adc_windows_for_export(event)
+                    ):
+                        continue
+
+                    source: dict[str, str] = {}
+
+                    if _is_gradient_event(event):
+                        source["repr_GradPulse"] = (
+                            f"{new_container}.atomic.basic_repr_grad"
+                        )
+                    elif _is_rf_event(event):
+                        source["repr_RFPulse"] = (
+                            f"{new_container}.atomic.basic_repr_rf"
+                        )
+                    elif _is_adc_event(event):
+                        source["repr_ADC"] = (
+                            f"{new_container}.atomic.basic_repr_adc"
+                        )
+                    else:
+                        continue
+
+                    base_key = _safe_path_token(
+                        new_container.rsplit(".", 1)[-1]
+                    )
+                    key = base_key
+                    suffix = 2
+                    while key in used_flat_keys:
+                        key = f"{base_key}_{suffix}"
+                        suffix += 1
+                    used_flat_keys.add(key)
+
+                    relative_tstart_path = (
+                        f"{aggregate_atomic}.seqstar_flat_tstart_{flat_index}"
+                    )
+                    params[relative_tstart_path] = _expr(
+                        inputs={
+                            "event_tstart": (
+                                f"{new_container}.seqstar_kernel_tstart"
+                            ),
+                            "parent_tstart": parent_absolute_start,
+                        },
+                        script="return event_tstart - parent_tstart",
+                    )
+
+                    source["key"] = key
+                    source["tstart"] = relative_tstart_path
+                    aggregate_sources.append(source)
+                    flat_index += 1
+
+                # Preserve existing behavior when this node has no primitive
+                # descendants that can be flattened safely.
+                if not aggregate_sources:
+                    for child in children:
+                        child_atomic = f"{child}.atomic"
+                        if child_atomic not in sequence_elements:
+                            continue
+                        key = _safe_path_token(
+                            child.rsplit(".", 1)[-1]
+                        )
+                        aggregate_sources.append(
+                            {
+                                "key": key,
+                                "tstart": f"{child}.tstart",
+                                "repr_GradPulse": (
+                                    f"{child_atomic}.full_basic_repr_GradPulse"
+                                ),
+                                "repr_RFPulse": (
+                                    f"{child_atomic}.full_basic_repr_RFPulse"
+                                ),
+                                "repr_ADC": (
+                                    f"{child_atomic}.full_basic_repr_ADC"
+                                ),
+                                "repr_TriggerPulse": (
+                                    f"{child_atomic}.full_basic_repr_TriggerPulse"
+                                ),
+                            }
+                        )
+            else:
+                # Preserve the established legacy lowering for sequences that
+                # do not declare an explicit root-based SeqStar hierarchy.
+                for child in children:
+                    child_atomic = f"{child}.atomic"
+                    if child_atomic not in sequence_elements:
+                        continue
+                    key = _safe_path_token(
+                        child.rsplit(".", 1)[-1]
+                    )
+                    aggregate_sources.append(
+                        {
+                            "key": key,
+                            "tstart": f"{child}.tstart",
+                            "repr_GradPulse": (
+                                f"{child_atomic}.full_basic_repr_GradPulse"
+                            ),
+                            "repr_RFPulse": (
+                                f"{child_atomic}.full_basic_repr_RFPulse"
+                            ),
+                            "repr_ADC": (
+                                f"{child_atomic}.full_basic_repr_ADC"
+                            ),
+                            "repr_TriggerPulse": (
+                                f"{child_atomic}.full_basic_repr_TriggerPulse"
+                            ),
+                        }
+                    )
+
+            if aggregate_sources:
+                aggregate_atomic = f"{parent_path}.atomic"
+                aggregate_atomic_paths.append(aggregate_atomic)
+                if parent_path == kernel_path:
+                    add_atomic_aggregate(
+                        aggregate_atomic,
+                        aggregate_sources,
+                    )
+                else:
+                    add_atomic_aggregate(
+                        aggregate_atomic,
+                        aggregate_sources,
+                        tstart_inputs={
+                            "t0": "root.tstart",
+                            "t1": f"{self._active_loop_path}.tstart",
+                            "t2": f"{kernel_path}.tstart",
+                            "t3": (
+                                f"{parent_path}.seqstar_resolved_tstart"
+                                if (
+                                    source_root_mode
+                                    and parent_path in node_absolute_extents
+                                )
+                                else f"{parent_path}.tstart"
+                            ),
+                        },
+                        tstart_script="return t0 + t1 + t2 + t3",
+                    )
+
         for event_id, old_container in list(self._event_container_paths.items()):
             self._event_container_paths[event_id] = rewrite_path(old_container)
         for event_id, old_leaf in list(self._event_container_leaves.items()):
             self._event_container_leaves[event_id] = rewrite_path(old_leaf)
 
-        # A compact repeated kernel represents exactly one repetition
-        # interval. Use the live protocol TR for the kernel display extent.
-        # This is generic for any compacted repeated motif and keeps the kernel
-        # workplace view synchronized with protocol edits.
+        # A compact repeated kernel represents exactly one repetition interval.
+        # Use the live protocol TR for the kernel display extent when applicable.
         if self._active_loop_path.endswith("seqstar_loop"):
             params[f"{kernel_path}.duration"] = _expr(
                 inputs={"TR": "root.prot.TR"},
                 script="return TR",
             )
 
+        # ------------------------------------------------------------------
+        # 5. Diagnostics and hierarchy validation.
+        # ------------------------------------------------------------------
+        if source_root_mode:
+            # The writer may have used root.average/kernel as an internal staging
+            # scope while constructing event objects.  Once every exported event
+            # has been reparented through the declared SeqStar hierarchy, those
+            # synthetic sequence elements must not appear in the gammaSTAR tree.
+            # Keep their parameters because existing timing expressions may still
+            # use them as internal dependency nodes; only the visible hierarchy is
+            # removed.
+            staging_prefix = self._active_loop_path
+            for path in list(sequence_elements):
+                if path == staging_prefix or path.startswith(staging_prefix + "."):
+                    sequence_elements.pop(path, None)
+
+            hierarchy_roots = sorted(
+                path
+                for path in node_metadata
+                if path.startswith("root.") and path.count(".") == 1
+            )
+            child_elements = sorted(
+                path
+                for path in sequence_elements
+                if any(
+                    path == branch or path.startswith(branch + ".")
+                    for branch in hierarchy_roots
+                )
+            )
+            hierarchy_path = "root"
+        else:
+            child_elements = sorted(
+                path for path in sequence_elements if path.startswith(kernel_path + ".")
+            )
+            hierarchy_path = kernel_path
+
+        atomic_elements = sorted(
+            path for path in child_elements if sequence_elements.get(path) == "Atomic"
+        )
+        loop_elements = sorted(
+            path for path in child_elements if sequence_elements.get(path) == "Loop"
+        )
+
         params["root.info.seqstar_block_grouping_enabled"] = _literal(True)
         params["root.info.seqstar_block_group_count"] = _literal(len(group_paths))
         params["root.info.seqstar_block_grouping_mode"] = _literal(
-            "block_local_rebased_loop_scope_tr_kernel_parent_atomic"
+            "hierarchical_native_composite_no_node_atomic"
         )
+        params["root.info.seqstar_kernel_path"] = _literal(hierarchy_path)
+        params["root.info.seqstar_kernel_child_count"] = _literal(len(child_elements))
+        params["root.info.seqstar_kernel_atomic_count"] = _literal(len(atomic_elements))
+        params["root.info.seqstar_kernel_loop_count"] = _literal(len(loop_elements))
+        params["root.info.seqstar_kernel_children"] = _literal(child_elements[:200])
+        params["root.info.seqstar_kernel_atomics"] = _literal(atomic_elements[:200])
+        params["root.info.seqstar_render_container_loops"] = _literal(loop_elements[:200])
+
+        if not child_elements:
+            raise ValueError(
+                "gammaSTAR export produced an empty SeqStar hierarchy: "
+                f"hierarchy_path={hierarchy_path!r}. This is a writer bug."
+            )
+        if not atomic_elements:
+            raise ValueError(
+                "gammaSTAR export produced no Atomic elements beneath the SeqStar hierarchy: "
+                f"hierarchy_path={hierarchy_path!r}. This is a writer bug."
+            )
 
     def _lower_implicit_synchronized_train_group(
         self,
@@ -5365,6 +6659,126 @@ class GenericGammaStarDocumentBuilder:
             ),
         )
 
+    def _compact_authored_arbitrary_rf_samples(
+        self,
+        *,
+        rf_event: Any,
+        shape: Any,
+        flip_angle: Any,
+    ) -> dict[str, Any] | None:
+        """Return compact gammaSTAR samples from authored arbitrary-RF input.
+
+        ``make_arbitrary_rf`` retains the original constructor signal while the
+        realized ``SeqStarRFArbitraryShape`` stores the scanner-rastered signal.
+        gammaSTAR is a design/visualization backend and does not need the full
+        scanner-raster expansion when the original uniformly sampled waveform
+        is still available.
+
+        This helper is intentionally sequence-agnostic.  It is used only for
+        arbitrary RF constructors, and only when the retained authored signal is
+        smaller than the realized raster signal.  Pulseq/scanner lowering is
+        unchanged.
+        """
+
+        metadata = getattr(rf_event, "metadata", None)
+        constructor = (
+            metadata.get("symbolic_constructor")
+            if isinstance(metadata, Mapping)
+            else None
+        )
+
+        if not isinstance(constructor, Mapping):
+            parameters = getattr(rf_event, "parameters", None)
+            constructor = (
+                parameters.get("_symbolic_constructor")
+                if isinstance(parameters, Mapping)
+                else None
+            )
+
+        if not isinstance(constructor, Mapping):
+            return None
+
+        if str(constructor.get("family", "")).lower() != "arbitrary":
+            return None
+
+        specs = constructor.get("specs")
+        if not isinstance(specs, Mapping):
+            return None
+
+        authored_signal = specs.get("signal")
+        if authored_signal is None:
+            return None
+
+        try:
+            authored_signal = list(authored_signal)
+        except TypeError:
+            return None
+
+        if not authored_signal:
+            return None
+
+        realized_signal = getattr(shape, "signal", None)
+        try:
+            realized_count = len(realized_signal)
+        except (TypeError, AttributeError):
+            realized_count = 0
+
+        # Keep the established realized representation unless the retained
+        # authored waveform is genuinely more compact.
+        if realized_count > 0 and len(authored_signal) >= realized_count:
+            return None
+
+        try:
+            duration = float(
+                getattr(
+                    shape,
+                    "duration",
+                    getattr(rf_event, "duration"),
+                )
+            )
+            resolved_flip_angle = float(flip_angle)
+            gamma_hz_per_t = float(self.system.gamma)
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        if (
+            not math.isfinite(duration)
+            or duration <= 0.0
+            or not math.isfinite(resolved_flip_angle)
+            or not math.isfinite(gamma_hz_per_t)
+            or gamma_hz_per_t <= 0.0
+        ):
+            return None
+
+        # Use the authored sample count over the resolved pulse duration. This
+        # preserves the original waveform representation while keeping the
+        # gammaSTAR pulse duration identical to the realized SeqStar event.
+        authored_dwell = duration / len(authored_signal)
+
+        try:
+            compact_shape = shape.__class__(
+                name=f"{getattr(shape, 'name', 'rf_shape')}_gammastar_compact",
+                duration=duration,
+                signal=authored_signal,
+                rf_raster_time=authored_dwell,
+                max_rf=getattr(shape, "max_rf", None),
+            )
+        except (TypeError, ValueError):
+            return None
+
+        if not hasattr(compact_shape, "to_gammastar_samples"):
+            return None
+
+        try:
+            return compact_shape.to_gammastar_samples(
+                flip_angle=resolved_flip_angle,
+                gamma_hz_per_t=gamma_hz_per_t,
+                max_rf=None,
+            )
+        except (TypeError, ValueError):
+            # Falling back to the already-realized shape is always safe.
+            return None
+
     def _rf_samples_parameter(
         self,
         *,
@@ -5398,6 +6812,14 @@ class GenericGammaStarDocumentBuilder:
             )
 
         if hasattr(shape, "to_gammastar_samples") and flip_angle is not None:
+            compact_samples = self._compact_authored_arbitrary_rf_samples(
+                rf_event=rf_event,
+                shape=shape,
+                flip_angle=flip_angle,
+            )
+            if compact_samples is not None:
+                return _literal(compact_samples)
+
             samples = shape.to_gammastar_samples(
                 flip_angle=float(flip_angle),
                 gamma_hz_per_t=float(self.system.gamma),
@@ -5786,9 +7208,47 @@ class GenericGammaStarDocumentBuilder:
             # replace those placeholders with the merged live protocol source.
             params[target_path] = new_param
 
+        # Preserve declared Protocol aliases as one live state variable rather
+        # than two independent editable copies.
+        protocol = getattr(self.symbolic_sequence, "protocol", None)
+        aliases = getattr(protocol, "aliases", None)
+        if not isinstance(aliases, Mapping):
+            protocol = getattr(self.sequence, "protocol", None)
+            aliases = getattr(protocol, "aliases", None)
+
+        if isinstance(aliases, Mapping):
+            for alias, canonical in aliases.items():
+                alias_key = _protocol_key(str(alias))
+                canonical_key = _protocol_key(str(canonical))
+                if alias_key == canonical_key:
+                    continue
+
+                alias_path = f"root.prot.{alias_key}"
+                canonical_path = f"root.prot.{canonical_key}"
+                canonical_param = params.get(canonical_path)
+
+                if (
+                    isinstance(canonical_param, Mapping)
+                    and _is_literal_parameter(canonical_param)
+                ):
+                    # An explicitly declared Protocol alias is part of the
+                    # authored protocol contract and therefore outranks any
+                    # generic writer fallback that may already occupy the alias
+                    # path (for example a synthetic TR inferred from flattened
+                    # sequence duration). Seed the editable alias from the
+                    # canonical authored value unconditionally.
+                    params[alias_path] = dict(canonical_param)
+                    params[canonical_path] = _expr(
+                        inputs={"value": alias_path},
+                        script="return value",
+                    )
+                elif canonical_path in params:
+                    params[alias_path] = _expr(
+                        inputs={"value": canonical_path},
+                        script="return value",
+                    )
+
         # Avoid two independent orientation state variables in the website.
-        # Some gammaSTAR templates expose "slice_orientation"; keep it as a
-        # compatibility alias of the PyPulseq-Star orientation parameter.
         params["root.prot.slice_orientation"] = _expr(
             inputs={"orientation": "root.prot.orientation"},
             script="return orientation",
@@ -8013,17 +9473,29 @@ def _block_parent_for_export(block: Any, node: str | None) -> str | None:
 
 
 def _block_local_name_for_export(block: Any, node: str | None) -> str | None:
-    """Return/infer block local name."""
+    """Return the concrete block-local name for export.
+
+    The logical SeqStar node path determines hierarchy only. Multiple concrete
+    blocks may intentionally belong to the same logical node, so the node's last
+    path component must not be reused as the block name. Prefer the concrete
+    block name created by ``seq.add_block(name=...)``; fall back to stored local
+    metadata and finally to the node token for legacy inputs.
+    """
+
+    value = getattr(block, "name", None)
+    if value:
+        return str(value)
 
     metadata = getattr(block, "metadata", None)
     if isinstance(metadata, Mapping):
         value = metadata.get("seqstar_local_name") or metadata.get("local_name")
         if value:
             return str(value)
+
     if node:
         return str(node).rsplit(".", 1)[-1]
-    value = getattr(block, "name", None)
-    return str(value) if value else None
+
+    return None
 
 
 def _safe_path_token(value: Any) -> str:
@@ -8125,7 +9597,19 @@ def _events_extent_duration(events: Iterable[Any]) -> float:
                 )
                 extent = max(extent, float(grad_data.get("duration", 0.0)))
                 continue
-            extent = max(extent, _event_delay(event) + _event_active_duration(event))
+
+            # Delay-only events represent one occupied interval. SeqStar delay
+            # objects intentionally mirror that same interval through both
+            # ``delay`` and ``duration`` for compatibility, so adding the two
+            # would double-count the block extent.
+            if _is_delay_event(event):
+                extent = max(extent, _event_active_duration(event))
+                continue
+
+            extent = max(
+                extent,
+                _event_delay(event) + _event_active_duration(event),
+            )
         except Exception:
             try:
                 extent = max(extent, calc_duration(event))
@@ -8212,6 +9696,17 @@ def _explicit_repeated_node_info(
         ):
             continue
         selected.append((name, record))
+
+    # The document-level writer can make one repeated node the outer
+    # gammaSTAR loop.  If there are multiple independent outer repeat nodes
+    # (for example, metabolite and water_reference acquisition families), do
+    # not arbitrarily choose the first one.  Return None so the generic writer
+    # preserves the full timeline under one kernel and later lowers each
+    # repeated node as a child loop/container inside that kernel.  This keeps
+    # the hierarchy sequence-agnostic and avoids hiding sibling acquisition
+    # families behind the first loop.
+    if len(selected) > 1:
+        return None
 
     for node_name, record in selected:
         owned_blocks = [
@@ -8883,6 +10378,17 @@ def _safe_block_duration(block: Any) -> float:
     return _events_extent_duration(events)
 
 
+
+def _literal_value(value: Any) -> Any:
+    """Best-effort extraction of a value from the writer's literal parameter form."""
+
+    if isinstance(value, Mapping):
+        if value.get("type") == "literal" and "value" in value:
+            return value.get("value")
+        if "value" in value and not value.get("inputs"):
+            return value.get("value")
+    return value
+
 def _resolve_sequence_relationships_for_export(sequence: Any) -> None:
     """Resolve relationship-derived timing before gammaSTAR export.
 
@@ -9214,27 +10720,105 @@ def _looks_event(obj: Any) -> bool:
     ):
         return False
 
-    return _is_rf_event(obj) or _is_adc_event(obj) or _is_gradient_event(obj)
+    return (
+        _is_rf_event(obj)
+        or _is_adc_event(obj)
+        or _is_gradient_event(obj)
+        or _is_delay_event(obj)
+    )
+
+
+def _is_delay_event(event: Any) -> bool:
+    """Return True for SeqStar/PyPulseq-style delay events.
+
+    Delay events do not create gammaSTAR waveform leaves, but their symbolic
+    duration relationships must remain available to the timing graph.
+    """
+
+    event_type = str(
+        getattr(event, "event_type", getattr(event, "type", "")) or ""
+    ).lower()
+    kind = str(getattr(event, "kind", "") or "").lower()
+    role = str(getattr(event, "role", "") or "").lower()
+    class_name = event.__class__.__name__.lower()
+
+    if event_type == "delay":
+        return True
+    if kind == "delay" or kind.startswith("delay"):
+        return True
+    if "delayevent" in class_name or class_name == "seqstardelayevent":
+        return True
+
+    # Role is only a final fallback because delays commonly use semantic roles
+    # such as echo_time_fill rather than the literal word "delay".
+    return role == "delay"
 
 
 def _is_rf_event(event: Any) -> bool:
-    event_type = str(getattr(event, "type", "")).lower()
-    kind = str(getattr(event, "kind", "")).lower()
-    role = str(getattr(event, "role", "")).lower()
-    use = str(getattr(event, "use", "")).lower()
+    """Return True only for explicitly RF-like events."""
+
+    # Explicit gradient events must never be classified as RF, even when
+    # their semantic name contains "rf" (for example an RF-select gradient).
+    if _is_gradient_event(event):
+        return False
+
+    event_type = str(
+        getattr(
+            event,
+            "event_type",
+            getattr(event, "type", ""),
+        )
+        or ""
+    ).lower()
+
+    kind = str(
+        getattr(event, "kind", "")
+        or ""
+    ).lower()
+
+    role = str(
+        getattr(event, "role", "")
+        or ""
+    ).lower()
+
+    use = str(
+        getattr(event, "use", "")
+        or ""
+    ).lower()
+
     class_name = event.__class__.__name__.lower()
-    name = str(getattr(event, "name", "")).lower()
 
-    return (
-        event_type == "rf"
-        or kind.startswith("rf")
-        or role in {"rf", "excitation", "refocusing", "inversion"}
-        or use in {"rf", "excitation", "refocusing", "inversion"}
-        or "rf" in class_name
-        or "rf" in name
-        or hasattr(event, "flip_angle")
-    )
+    if event_type == "rf":
+        return True
 
+    if kind.startswith("rf"):
+        return True
+
+    if (
+        "rfevent" in class_name
+        or "rfblockevent" in class_name
+    ):
+        return True
+
+    if role in {
+        "rf",
+        "excitation",
+        "refocusing",
+        "inversion",
+        "saturation",
+    }:
+        return True
+
+    if use in {
+        "rf",
+        "excitation",
+        "refocusing",
+        "inversion",
+        "saturation",
+    }:
+        return True
+
+    return getattr(event, "flip_angle", None) is not None
 
 def _is_adc_event(event: Any) -> bool:
     event_type = str(getattr(event, "type", "")).lower()
@@ -9351,17 +10935,29 @@ def _merge_protocol_values_for_export(
         return values
 
     symbolic_values = _collect_protocol_values(symbolic_sequence)
+
+    symbolic_protocol = getattr(symbolic_sequence, "protocol", None)
+    symbolic_aliases = getattr(symbolic_protocol, "aliases", None)
+    explicit_alias_names = (
+        {str(alias) for alias in symbolic_aliases}
+        if isinstance(symbolic_aliases, Mapping)
+        else set()
+    )
+
     for key, value in symbolic_values.items():
         key_text = str(key)
         canonical_key = _protocol_key(key_text)
 
-        # Symbolic relationships override resolved numeric defaults.
         if _contains_protocol_expression(value):
             values[key_text] = value
             values[canonical_key] = value
             continue
 
-        # Preserve symbolic-only values not present in the resolved export.
+        if key_text in explicit_alias_names:
+            values[key_text] = value
+            values[canonical_key] = value
+            continue
+
         if key_text not in values and canonical_key not in values:
             values[key_text] = value
 
@@ -9420,32 +11016,44 @@ def _collect_protocol_values(sequence: Any) -> dict[str, Any]:
         if isinstance(protocol_parameters, Mapping):
             values.update(protocol_parameters)
 
+        # Preserve Protocol aliases as live views of their canonical sources.
+        # This is generic: aliases are declared by Protocol, not inferred from
+        # sequence names.  It prevents backend fallbacks such as a synthetic TR
+        # from replacing an explicitly authored alias.
+        protocol_aliases = getattr(protocol, "aliases", None)
+        if isinstance(protocol_aliases, Mapping):
+            for alias, canonical in protocol_aliases.items():
+                alias_key = str(alias)
+                canonical_key = str(canonical)
+                if canonical_key in values:
+                    values[alias_key] = values[canonical_key]
+
         if hasattr(protocol, "to_template_context"):
             try:
                 context = protocol.to_template_context()
                 if isinstance(context, Mapping):
-                    # Do not let a resolved/template context overwrite explicit
-                    # protocol.parameters entries that are still symbolic. This
-                    # is essential for v0.2 protocol-control relationships such
-                    # as:
+                    # Explicit protocol.parameters values are authoritative.
+                    # Template/display context is fallback-only and must never
+                    # replace an authored parameter, whether that authored
+                    # value is numeric or symbolic.
                     #
-                    #   phase_encode_start = -0.5 * p.n_y / p.fov
-                    #   phase_encode_step  =  1.0 / p.fov
+                    # This preserves the generic precedence:
                     #
-                    # Protocol.to_template_context() is allowed to contain
-                    # resolved numeric defaults for display/export, but those
-                    # defaults must not replace symbolic protocol relationships
-                    # before _protocol_parameter() has a chance to compile them
-                    # into gammaSTAR inputs/scripts.
+                    #   protocol.parameters
+                    #       > symbolic relationships
+                    #       > template/display context
+                    #       > writer fallbacks
+                    #
+                    # and prevents resolved/display values such as a flattened
+                    # sequence duration from seeding protocol controls like TR.
                     for key, value in context.items():
-                        existing = values.get(key)
-                        canonical_existing = values.get(_protocol_key(str(key)))
-                        if (
-                            _contains_protocol_expression(existing)
-                            or _contains_protocol_expression(canonical_existing)
-                        ):
+                        key_text = str(key)
+                        canonical_key = _protocol_key(key_text)
+
+                        if key_text in values or canonical_key in values:
                             continue
-                        values[key] = value
+
+                        values[key_text] = value
             except Exception:
                 pass
 

@@ -42,6 +42,10 @@ dependencies = [
 plotting = [
   "matplotlib>=3.7",
 ]
+
+rf = [
+    "sigpy>=0.1.25",
+]
 dashboard = [
   "grandalf>=0.8",
   "matplotlib>=3.7",

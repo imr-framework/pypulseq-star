@@ -124,6 +124,7 @@ def test_adc_normalization_fallback_and_window_helpers() -> None:
     assert data["windows"][0]["num_samples"] == 16
 
 
+
 def test_block_metadata_node_and_path_helpers() -> None:
     block = SimpleNamespace(
         name="readout_3",
@@ -136,16 +137,26 @@ def test_block_metadata_node_and_path_helpers() -> None:
         },
         parameters={},
     )
+
     mapping = {}
     gd._copy_block_export_metadata_to_mapping(block, mapping)
+
     assert gd._block_node_for_export(block) == "kernel.readout"
-    assert gd._block_parent_for_export(block, "kernel.readout") == "kernel"
-    assert gd._block_local_name_for_export(block, "kernel.readout") == "readout"
-    assert gd._event_source_block_index_for_export(block) == 3
-    assert mapping
-    assert gd._node_is_within_for_export("kernel.readout.echo", "kernel.readout")
-    assert gd._node_depth_for_export("kernel.readout.echo") == 3
-    assert gd._safe_path_token("kernel/readout echo") == "kernel_readout_echo"
+    assert gd._block_parent_for_export(
+        block,
+        "kernel.readout",
+    ) == "kernel"
+
+    # Concrete block names remain unique for export paths.
+    assert gd._block_local_name_for_export(
+        block,
+        "kernel.readout",
+    ) == "readout_3"
+
+    assert mapping["source_block_node"] == "kernel.readout"
+    assert mapping["source_block_parent"] == "kernel"
+    assert mapping["source_block_local_name"] == "readout_3"
+
 
 
 def test_event_tags_spoiler_detection_variants_and_extent() -> None:

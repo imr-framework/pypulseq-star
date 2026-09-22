@@ -235,9 +235,33 @@ class PulseqWriter:
                     if not events:
                         continue
 
+                    motif_record = _sequence_node_registry(self.sequence).get(
+                        motif_name,
+                        {},
+                    )
+                    motif_counter = (
+                        str(motif_record.get("counter"))
+                        if isinstance(motif_record, Mapping)
+                        and motif_record.get("counter")
+                        else None
+                    )
+                    motif_context = (
+                        {motif_counter: _motif_index}
+                        if motif_counter is not None
+                        else {}
+                    )
+
                     for _block_repeat_index in range(block_repetitions):
+                        varied_events = [
+                            _event_with_table_variations_for_context(
+                                event,
+                                sequence=self.sequence,
+                                context=motif_context,
+                            )
+                            for event in events
+                        ]
                         pulseq_event_groups = _events_to_pulseq_event_groups(
-                            events,
+                            varied_events,
                             system=pulseq_seq.system,
                             adc_train_policy=self.adc_train_policy,
                             allow_multiwindow_adc_with_other_events=(
@@ -2435,6 +2459,176 @@ def _event_variants_for_context(
     return copy.deepcopy(variants[flat_index])
 
 
+def _variation_records_for_event(
+    event: Any,
+    *,
+    sequence: Any,
+) -> list[Mapping[str, Any]]:
+    """Return declarative node.vary() records associated with an event.
+
+    This mirrors the existing metadata/parameter storage contract and falls back
+    to event-name matching in the logical-node registry after resolution or
+    deepcopy has changed Python object identity.
+    """
+
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, Mapping):
+        variations = metadata.get("seqstar_variations")
+        if isinstance(variations, Iterable) and not isinstance(
+            variations, (str, bytes, bytearray, Mapping)
+        ):
+            records = [item for item in variations if isinstance(item, Mapping)]
+            if records:
+                return records
+
+        binding = metadata.get("seqstar_loop_binding")
+        if isinstance(binding, Mapping):
+            return [binding]
+
+    parameters = getattr(event, "parameters", None)
+    if isinstance(parameters, Mapping):
+        variations = parameters.get("_seqstar_variations")
+        if isinstance(variations, Iterable) and not isinstance(
+            variations, (str, bytes, bytearray, Mapping)
+        ):
+            records = [item for item in variations if isinstance(item, Mapping)]
+            if records:
+                return records
+
+    event_name = str(
+        getattr(event, "name", None)
+        or getattr(event, "path", None)
+        or event.__class__.__name__
+    )
+    for record in _sequence_node_registry(sequence).values():
+        variations = record.get("variations")
+        if not isinstance(variations, Iterable) or isinstance(
+            variations, (str, bytes, bytearray, Mapping)
+        ):
+            continue
+        matched: list[Mapping[str, Any]] = []
+        for item in variations:
+            if not isinstance(item, Mapping):
+                continue
+            names = item.get("event_names")
+            if isinstance(names, Iterable) and not isinstance(
+                names, (str, bytes, bytearray, Mapping)
+            ):
+                if event_name in {str(name) for name in names}:
+                    matched.append(item)
+        if matched:
+            return matched
+
+    return []
+
+
+def _set_event_variation_property(
+    event: Any,
+    *,
+    attribute: str,
+    value: Any,
+) -> None:
+    """Set one varied property on a copied event and its ADC windows.
+
+    Parent event attributes are the normal Pulseq lowering source. Enriched ADC
+    trains additionally carry per-window phase/frequency values, so matching
+    window properties are updated when present.
+    """
+
+    try:
+        setattr(event, attribute, value)
+    except Exception:
+        pass
+
+    parameters = getattr(event, "parameters", None)
+    if isinstance(parameters, dict):
+        parameters[attribute] = value
+
+    shape = getattr(event, "shape", None)
+    windows = getattr(shape, "windows", None) if shape is not None else None
+    if windows is None:
+        windows = getattr(event, "windows", None)
+
+    if windows is not None:
+        for window in windows:
+            if isinstance(window, dict):
+                window[attribute] = value
+                continue
+            try:
+                setattr(window, attribute, value)
+            except Exception:
+                pass
+
+
+def _event_with_table_variations_for_context(
+    event: Any,
+    *,
+    sequence: Any,
+    context: dict[str, int],
+) -> Any:
+    """Return an event copy with any active ``mode='table'`` variations.
+
+    Existing arithmetic variation modes are deliberately left untouched here.
+    This keeps the current Pulseq writer behavior backward compatible while
+    adding only the table-valued lowering required by the generic variation
+    contract.
+    """
+
+    records = _variation_records_for_event(event, sequence=sequence)
+    active: list[tuple[str, Any]] = []
+
+    for binding in records:
+        mode = str(binding.get("mode") or "linear").strip().lower()
+        if mode != "table":
+            continue
+
+        counter = str(binding.get("counter") or "").strip()
+        if not counter or counter not in context:
+            continue
+
+        values = binding.get("values")
+        if values is None:
+            raise ValueError(
+                "Table variation requires a non-empty values table."
+            )
+        try:
+            table = tuple(values)
+        except TypeError as exc:
+            raise TypeError(
+                "Table variation values must be iterable."
+            ) from exc
+        if not table:
+            raise ValueError(
+                "Table variation requires at least one value."
+            )
+
+        index = int(context[counter]) % len(table)
+        value = table[index]
+
+        wrap = binding.get("wrap")
+        if wrap is not None:
+            wrap_value = float(wrap)
+            if wrap_value != 0:
+                value = float(value) % wrap_value
+
+        attribute = str(binding.get("attribute") or "").strip()
+        if not attribute:
+            continue
+        active.append((attribute, value))
+
+    if not active:
+        return event
+
+    varied = copy.deepcopy(event)
+    for attribute, value in active:
+        _set_event_variation_property(
+            varied,
+            attribute=attribute,
+            value=value,
+        )
+    return varied
+
+
 def _emit_one_block_with_context(
     *,
     sequence: Any,
@@ -2445,8 +2639,12 @@ def _emit_one_block_with_context(
     allow_multiwindow_adc_with_other_events: bool,
 ) -> float:
     events = [
-        _event_variants_for_context(
-            event,
+        _event_with_table_variations_for_context(
+            _event_variants_for_context(
+                event,
+                sequence=sequence,
+                context=context,
+            ),
             sequence=sequence,
             context=context,
         )

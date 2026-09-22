@@ -36,7 +36,8 @@ def make_block_pulse(
     max_grad: float | None = None,
     max_slew: float | None = None,
     return_gz: bool = False,
-    channel: str = "z",
+    channel: str | None = None,
+    axis_role: str | None = None,
 ) -> SeqStarRFBlockEvent | tuple[SeqStarRFBlockEvent, Any, Any]:
     """Create an enriched rectangular RF pulse.
 
@@ -61,6 +62,7 @@ def make_block_pulse(
         "slice_thickness": slice_thickness,
         "bandwidth": bandwidth,
         "use": use,
+        "axis_role": axis_role,
     }
 
     symbolic_event_specs = symbolic_specs(
@@ -198,6 +200,7 @@ def make_block_pulse(
         max_slew=max_slew,
         return_gz=return_gz,
         channel=channel,
+        axis_role=axis_role,
     )
 
 
@@ -212,6 +215,7 @@ def make_sinc_pulse(
     time_bw_product: float | None = None,
     apodization: float | None = None,
     center_pos: float | None = None,
+    rf_constraint_policy: str = "strict",
     delay: float | None = None,
     system: Opts | None = None,
     parameters: Mapping[str, Any] | None = None,
@@ -219,7 +223,8 @@ def make_sinc_pulse(
     max_grad: float | None = None,
     max_slew: float | None = None,
     return_gz: bool = False,
-    channel: str = "z",
+    channel: str | None = None,
+    axis_role: str | None = None,
     gz_name: str | None = None,
     gzr_name: str | None = None,
 ) -> SeqStarRFBlockEvent:
@@ -258,9 +263,11 @@ def make_sinc_pulse(
         "time_bw_product": time_bw_product,
         "apodization": apodization,
         "center_pos": center_pos,
+        "rf_constraint_policy": rf_constraint_policy,
         "delay": delay,
         "slice_thickness": slice_thickness,
         "use": use,
+        "axis_role": axis_role,
     }
 
     symbolic_event_specs = symbolic_specs(
@@ -360,15 +367,19 @@ def make_sinc_pulse(
         center_pos=resolved_center_pos,
     )
 
-    raster_duration = _round_to_raster(
+    constraint_policy = _normalize_rf_constraint_policy(
+        rf_constraint_policy
+    )
+
+    requested_raster_duration = _round_to_raster(
         value=resolved_duration,
         raster=system.rf_raster_time,
         name="RF duration",
     )
 
-    amplitude_t = _sinc_rf_amplitude_t(
+    requested_amplitude_t = _sinc_rf_amplitude_t(
         flip_angle=resolved_flip_angle,
-        duration=raster_duration,
+        duration=requested_raster_duration,
         gamma_hz_per_t=system.gamma,
         rf_raster_time=system.rf_raster_time,
         time_bw_product=resolved_time_bw_product,
@@ -376,15 +387,33 @@ def make_sinc_pulse(
         center_pos=resolved_center_pos,
     )
 
+    if (
+        constraint_policy == "stretch"
+        and requested_amplitude_t > system.max_rf
+    ):
+        raster_duration, amplitude_t = _stretch_sinc_duration_to_max_rf(
+            flip_angle=resolved_flip_angle,
+            duration=requested_raster_duration,
+            gamma_hz_per_t=system.gamma,
+            rf_raster_time=system.rf_raster_time,
+            block_duration_raster=system.block_duration_raster,
+            time_bw_product=resolved_time_bw_product,
+            apodization=resolved_apodization,
+            center_pos=resolved_center_pos,
+            max_rf=system.max_rf,
+        )
+    else:
+        raster_duration = requested_raster_duration
+        amplitude_t = requested_amplitude_t
+
     if amplitude_t > system.max_rf:
         raise ValueError(
             "RF sinc pulse exceeds system.max_rf. "
             f"Required peak B1 = {amplitude_t:.6g} T, "
             f"system.max_rf = {system.max_rf:.6g} T. "
             "Increase duration, lower flip_angle, reduce apodization/TBW, "
-            "or update system.max_rf."
+            "set rf_constraint_policy='stretch', or update system.max_rf."
         )
-
     from pypulseq_star.shapes.rf import SeqStarRFSincShape
 
     shape = SeqStarRFSincShape(
@@ -431,16 +460,95 @@ def make_sinc_pulse(
         },
     )
 
+    realized_bandwidth_hz = (
+        resolved_time_bw_product
+        / raster_duration
+    )
+
+    requested_bandwidth_hz = (
+        resolved_time_bw_product
+        / requested_raster_duration
+    )
+
+    if hasattr(event, "parameters") and isinstance(event.parameters, dict):
+        event.parameters.setdefault(
+            "rf_constraint_policy",
+            constraint_policy,
+        )
+        event.parameters.setdefault(
+            "requested_duration",
+            requested_raster_duration,
+        )
+        event.parameters.setdefault(
+            "realized_duration",
+            raster_duration,
+        )
+        event.parameters.setdefault(
+            "requested_peak_b1_t",
+            requested_amplitude_t,
+        )
+        event.parameters.setdefault(
+            "realized_peak_b1_t",
+            amplitude_t,
+        )
+        event.parameters.setdefault(
+            "requested_bandwidth_hz",
+            requested_bandwidth_hz,
+        )
+        event.parameters.setdefault(
+            "realized_bandwidth_hz",
+            realized_bandwidth_hz,
+        )
+        event.parameters.setdefault(
+            "rf_duration_adapted",
+            not math.isclose(
+                raster_duration,
+                requested_raster_duration,
+                rel_tol=0.0,
+                abs_tol=0.5 * system.rf_raster_time,
+            ),
+        )
+
+    if hasattr(event, "metadata") and isinstance(event.metadata, dict):
+        rf_shape = event.metadata.setdefault("rf_shape", {})
+        if isinstance(rf_shape, dict):
+            rf_shape.update(
+                {
+                    "rf_constraint_policy": constraint_policy,
+                    "requested_duration": requested_raster_duration,
+                    "realized_duration": raster_duration,
+                    "requested_peak_b1_t": requested_amplitude_t,
+                    "realized_peak_b1_t": amplitude_t,
+                    "requested_bandwidth_hz": requested_bandwidth_hz,
+                    "realized_bandwidth_hz": realized_bandwidth_hz,
+                    "duration_adapted": not math.isclose(
+                        raster_duration,
+                        requested_raster_duration,
+                        rel_tol=0.0,
+                        abs_tol=0.5 * system.rf_raster_time,
+                    ),
+                }
+            )
+
     if hasattr(event, "parameters") and isinstance(event.parameters, dict):
         event.parameters.setdefault("time_bw_product", resolved_time_bw_product)
         event.parameters.setdefault("tbw", resolved_time_bw_product)
         event.parameters.setdefault("apodization", resolved_apodization)
         event.parameters.setdefault("center_pos", resolved_center_pos)
 
+    realized_constructor_specs = dict(constructor_specs)
+    if constraint_policy == "stretch":
+        # Preserve the authored request separately in event metadata/parameters,
+        # but make the realized, hardware-legal RF duration authoritative for
+        # downstream sequence resolution and writer reconstruction.
+        realized_constructor_specs["duration"] = raster_duration
+        realized_constructor_specs["time_bw_product"] = resolved_time_bw_product
+        realized_constructor_specs["rf_constraint_policy"] = constraint_policy
+
     _attach_rf_symbolic_constructor(
         event,
         family="sinc",
-        specs=constructor_specs,
+        specs=realized_constructor_specs,
     )
     attach_symbolic_specs(event, symbolic_event_specs)
 
@@ -459,6 +567,7 @@ def make_sinc_pulse(
         max_slew=max_slew,
         return_gz=return_gz,
         channel=channel,
+        axis_role=axis_role,
         gz_name=gz_name or "ssel_gz",
         gzr_name=gzr_name or "gz_rephaser",
     )
@@ -481,7 +590,8 @@ def make_gauss_pulse(
     max_grad: float | None = None,
     max_slew: float | None = None,
     return_gz: bool = False,
-    channel: str = "z",
+    channel: str | None = None,
+    axis_role: str | None = None,
 ) -> SeqStarRFBlockEvent:
     """Create an enriched Gaussian RF pulse.
 
@@ -509,6 +619,7 @@ def make_gauss_pulse(
         "delay": delay,
         "slice_thickness": slice_thickness,
         "use": use,
+        "axis_role": axis_role,
     }
 
     symbolic_event_specs = symbolic_specs(
@@ -707,11 +818,12 @@ def make_gauss_pulse(
         max_slew=max_slew,
         return_gz=return_gz,
         channel=channel,
+        axis_role=axis_role,
     )
 
 
 def make_arbitrary_rf(
-    signal: Iterable[float] | None = None,
+    signal: Iterable[complex] | None = None,
     flip_angle: float | None = None,
     *,
     duration: float | None = None,
@@ -727,7 +839,8 @@ def make_arbitrary_rf(
     max_grad: float | None = None,
     max_slew: float | None = None,
     return_gz: bool = False,
-    channel: str = "z",
+    channel: str | None = None,
+    axis_role: str | None = None,
 ) -> SeqStarRFBlockEvent:
     """Create an enriched arbitrary RF pulse from user-provided samples.
 
@@ -752,6 +865,7 @@ def make_arbitrary_rf(
         "delay": delay,
         "slice_thickness": slice_thickness,
         "use": use,
+        "axis_role": axis_role,
     }
 
     symbolic_event_specs = symbolic_specs(
@@ -825,7 +939,7 @@ def make_arbitrary_rf(
         name="RF duration",
     )
 
-    raster_signal = _resample_real_signal_to_raster(
+    raster_signal = _resample_complex_signal_to_raster(
         signal=resolved_signal,
         duration=raster_duration,
         rf_raster_time=system.rf_raster_time,
@@ -926,6 +1040,7 @@ def make_arbitrary_rf(
         max_slew=max_slew,
         return_gz=return_gz,
         channel=channel,
+        axis_role=axis_role,
     )
 
 
@@ -1076,6 +1191,61 @@ def _resolve_slice_thickness_argument(
     return resolved
 
 
+def _resolve_selective_gradient_axis(
+    *,
+    channel: str | None,
+    axis_role: str | None,
+) -> tuple[str | None, str]:
+    """Resolve legacy physical-channel and new logical-axis RF selection modes.
+
+    Parameters
+    ----------
+    channel
+        Optional physical PyPulseq construction channel (``x``, ``y``, ``z``).
+        This remains supported for backward compatibility and low-level use.
+
+    axis_role
+        Optional logical PyPulseq-Star localization axis
+        (``read``, ``phase``, ``slice``). New geometry-aware code should prefer
+        this argument and normally leave ``channel=None``.
+
+    Returns
+    -------
+    tuple[str | None, str]
+        ``(resolved_channel, resolved_axis_role)``.
+
+    Notes
+    -----
+    Legacy calls that supply neither argument retain the historical behavior:
+    a physical ``z`` construction channel with logical role ``slice``.
+    """
+
+    if axis_role is None:
+        # Preserve the historical RF-constructor default.
+        return ("z" if channel is None else str(channel).lower()), "slice"
+
+    normalized_axis = str(axis_role).strip().lower()
+    if normalized_axis not in {"read", "phase", "slice"}:
+        raise ValueError(
+            "axis_role must be one of 'read', 'phase', or 'slice'. "
+            f"Passed: {axis_role!r}"
+        )
+
+    if channel is not None:
+        normalized_channel = str(channel).strip().lower()
+        if normalized_channel not in {"x", "y", "z"}:
+            raise ValueError(
+                "channel must be one of 'x', 'y', or 'z' when supplied. "
+                f"Passed: {channel!r}"
+            )
+        return normalized_channel, normalized_axis
+
+    # Logical authoring: leave channel unset so make_trapezoid() assigns its
+    # canonical internal construction channel while retaining logical geometry
+    # as authoritative metadata.
+    return None, normalized_axis
+
+
 def _return_rf_with_optional_slice_select_gradient(
     event,
     *,
@@ -1092,15 +1262,18 @@ def _return_rf_with_optional_slice_select_gradient(
     max_slew,
     return_gz,
     channel,
+    axis_role: str | None = None,
     gz_name: str | None = None,
     gzr_name: str | None = None,
 ) -> SeqStarRFBlockEvent | tuple[SeqStarRFBlockEvent, Any, Any]:
-    """Return RF alone or ``(rf, gz, gzr)`` with slice-select gradients.
+    """Return RF alone or ``(rf, gz, gzr)`` with selective gradients.
 
-    The returned gradients are normal SeqStar trapezoid gradient events:
+    The returned gradients are normal SeqStar trapezoid gradient events. The
+    historical names ``gz`` / ``gzr`` are retained for compatibility even when
+    the logical localization axis is ``read`` or ``phase``:
 
-    - ``gz`` is the slice-select gradient intended to be simultaneous with RF.
-    - ``gzr`` is the slice-refocusing/rephasing lobe intended after RF.
+    - ``gz`` is the selection gradient intended to be simultaneous with RF.
+    - ``gzr`` is the selection-refocusing/rephasing lobe intended after RF.
 
     Naming policy:
         ``name`` names the RF event.
@@ -1114,6 +1287,22 @@ def _return_rf_with_optional_slice_select_gradient(
 
     slice_select_name = gz_name or "gz_ssel"
     slice_refocus_name = gzr_name or "gz_rephaser"
+
+    # Backward compatibility:
+    #
+    # Historically these RF constructors created a physical z gradient and
+    # labeled it as logical ``slice``. Preserve that behavior when callers
+    # provide neither ``channel`` nor ``axis_role``.
+    #
+    # New code should normally provide only ``axis_role`` (read/phase/slice).
+    # In that case ``channel`` remains None and make_trapezoid() authors the
+    # gradient logically, allowing EncodingFrame to perform scanner-axis
+    # realization later. A physical ``channel`` can still be supplied
+    # explicitly for legacy or low-level use.
+    resolved_channel, resolved_axis_role = _resolve_selective_gradient_axis(
+        channel=channel,
+        axis_role=axis_role,
+    )
 
     if slice_thickness is None:
         if return_gz:
@@ -1166,6 +1355,8 @@ def _return_rf_with_optional_slice_select_gradient(
     gz_metadata = {
         "family": "slice_select",
         "source_rf": name,
+        "logical_axis": resolved_axis_role,
+        "axis_role": resolved_axis_role,
         "source_rf_type": pulse_type,
         "slice_thickness": resolved_slice_thickness,
         "bandwidth_hz": gradient_bandwidth,
@@ -1182,7 +1373,7 @@ def _return_rf_with_optional_slice_select_gradient(
     }
 
     gz = make_trapezoid(
-        channel=channel,
+        channel=resolved_channel,
         amplitude=gradient_amplitude,
         flat_time=duration,
         delay=rf_delay,
@@ -1191,7 +1382,7 @@ def _return_rf_with_optional_slice_select_gradient(
         max_slew=max_slew,
         name=slice_select_name,
         role="slice_select",
-        axis_role="slice",
+        axis_role=resolved_axis_role,
         metadata=gz_metadata,
     )
 
@@ -1215,6 +1406,8 @@ def _return_rf_with_optional_slice_select_gradient(
     gzr_metadata = {
         "family": "slice_refocus",
         "source_rf": name,
+        "logical_axis": resolved_axis_role,
+        "axis_role": resolved_axis_role,
         "source_rf_type": pulse_type,
         "slice_thickness": resolved_slice_thickness,
         "bandwidth_hz": gradient_bandwidth,
@@ -1231,7 +1424,7 @@ def _return_rf_with_optional_slice_select_gradient(
     }
 
     gzr = make_trapezoid(
-        channel=channel,
+        channel=resolved_channel,
         area=refocus_area,
         delay=0.0,
         system=system,
@@ -1239,7 +1432,7 @@ def _return_rf_with_optional_slice_select_gradient(
         max_slew=max_slew,
         name=slice_refocus_name,
         role="slice_refocus",
-        axis_role="slice",
+        axis_role=resolved_axis_role,
         metadata=gzr_metadata,
     )
 
@@ -1261,7 +1454,9 @@ def _return_rf_with_optional_slice_select_gradient(
         event.parameters.setdefault("slice_select_gradient_amplitude", gradient_amplitude)
         event.parameters.setdefault("slice_select_gradient_area", gz_area)
         event.parameters.setdefault("slice_refocus_gradient_area", refocus_area)
-        event.parameters.setdefault("slice_select_channel", channel)
+        event.parameters.setdefault("slice_select_channel", resolved_channel)
+        event.parameters.setdefault("slice_select_axis_role", resolved_axis_role)
+        event.parameters.setdefault("logical_axis", resolved_axis_role)
         event.parameters.setdefault("slice_select_gradient_name", gz_actual_name)
         event.parameters.setdefault("slice_refocus_gradient_name", gzr_actual_name)
         event.parameters.setdefault("return_gz", bool(return_gz))
@@ -1715,10 +1910,10 @@ def _resolve_string_parameter(
 
 def _resolve_arbitrary_signal(
     *,
-    explicit_signal: Iterable[float] | None,
+    explicit_signal: Iterable[complex] | None,
     parameters: Mapping[str, Any],
-) -> list[float]:
-    """Resolve and validate arbitrary RF envelope samples."""
+) -> list[complex]:
+    """Resolve and validate arbitrary RF waveform samples."""
 
     signal_source = explicit_signal
 
@@ -1742,40 +1937,41 @@ def _resolve_arbitrary_signal(
     try:
         signal = list(signal_source)
     except TypeError as exc:
-        raise TypeError("signal must be an iterable of real-valued samples.") from exc
+        raise TypeError(
+            "signal must be an iterable of numeric RF samples."
+        ) from exc
 
     if not signal:
-        raise ValueError("signal must contain at least one sample.")
+        raise ValueError(
+            "signal must contain at least one sample."
+        )
 
-    real_signal: list[float] = []
+    complex_signal: list[complex] = []
 
     for index, value in enumerate(signal):
-        if isinstance(value, complex):
-            if abs(value.imag) > 1e-12:
-                raise NotImplementedError(
-                    "Complex arbitrary RF samples are not supported yet. "
-                    "Use a real-valued envelope for now. Per-sample RF phase "
-                    "modulation will be added later."
-                )
-            value = value.real
-
         try:
-            real_value = float(value)
+            sample = complex(value)
         except (TypeError, ValueError) as exc:
             raise TypeError(
-                f"signal[{index}]={value!r} cannot be converted to float."
+                f"signal[{index}]={value!r} cannot be converted to complex."
             ) from exc
 
-        if not math.isfinite(real_value):
-            raise ValueError(f"signal[{index}] must be finite. Passed: {real_value}")
+        if not (
+            math.isfinite(sample.real)
+            and math.isfinite(sample.imag)
+        ):
+            raise ValueError(
+                f"signal[{index}] must be finite. Passed: {sample!r}"
+            )
 
-        real_signal.append(real_value)
+        complex_signal.append(sample)
 
-    if max(abs(value) for value in real_signal) <= 0:
-        raise ValueError("signal must not be all zeros.")
+    if max(abs(value) for value in complex_signal) <= 0:
+        raise ValueError(
+            "signal must not be all zeros."
+        )
 
-    return real_signal
-
+    return complex_signal
 
 def _first_present(
     parameters: Mapping[str, Any],
@@ -1854,6 +2050,148 @@ def _block_rf_amplitude_t(
         raise ValueError(f"gamma_hz_per_t must be positive. Passed: {gamma_hz_per_t}")
 
     return flip_angle / (2.0 * math.pi * gamma_hz_per_t * duration)
+
+
+def _normalize_rf_constraint_policy(
+    value: str | None,
+) -> str:
+    """Return a validated RF hardware-constraint policy."""
+
+    policy = str(value or "strict").strip().lower()
+
+    if policy not in {"strict", "stretch"}:
+        raise ValueError(
+            "rf_constraint_policy must be 'strict' or 'stretch'. "
+            f"Passed: {value!r}"
+        )
+
+    return policy
+
+
+def _stretch_sinc_duration_to_max_rf(
+    *,
+    flip_angle: float,
+    duration: float,
+    gamma_hz_per_t: float,
+    rf_raster_time: float,
+    block_duration_raster: float,
+    time_bw_product: float,
+    apodization: float,
+    center_pos: float,
+    max_rf: float,
+) -> tuple[float, float]:
+    """Return the shortest rasterized sinc duration satisfying max_rf.
+
+    The flip angle and time-bandwidth product are preserved. Therefore
+    increasing duration lowers the realized RF bandwidth while retaining the
+    same normalized sinc shape.
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(realized_duration_s, realized_peak_b1_t)``.
+    """
+
+    if max_rf <= 0:
+        raise ValueError(
+            f"max_rf must be positive. Passed: {max_rf}"
+        )
+
+    if block_duration_raster <= 0:
+        raise ValueError(
+            "block_duration_raster must be positive. "
+            f"Passed: {block_duration_raster}"
+        )
+
+    # A stretched RF duration must satisfy both the RF raster and the
+    # enclosing block-duration raster. In normal scanner configurations the
+    # block raster is an integer multiple of the RF raster (for example
+    # 10 us vs 2 us). Use the block raster when that relationship holds;
+    # otherwise fail explicitly rather than returning a realization that can
+    # pass the RF check but fail sequence timing validation.
+    raster_ratio = block_duration_raster / rf_raster_time
+    if not math.isclose(
+        raster_ratio,
+        round(raster_ratio),
+        rel_tol=0.0,
+        abs_tol=1e-9,
+    ):
+        raise ValueError(
+            "block_duration_raster must be an integer multiple of "
+            "rf_raster_time for sinc RF stretching. "
+            f"block_duration_raster={block_duration_raster}, "
+            f"rf_raster_time={rf_raster_time}."
+        )
+
+    realization_raster = block_duration_raster
+
+    # Never shorten an authored duration during hardware adaptation.
+    n_realization = max(
+        1,
+        math.ceil(
+            duration / realization_raster
+            - 1e-12
+        ),
+    )
+    raster_duration = n_realization * realization_raster
+
+    amplitude_t = _sinc_rf_amplitude_t(
+        flip_angle=flip_angle,
+        duration=raster_duration,
+        gamma_hz_per_t=gamma_hz_per_t,
+        rf_raster_time=rf_raster_time,
+        time_bw_product=time_bw_product,
+        apodization=apodization,
+        center_pos=center_pos,
+    )
+
+    if amplitude_t <= max_rf:
+        return raster_duration, amplitude_t
+
+    # At fixed flip angle and TBW, peak B1 is approximately inversely
+    # proportional to pulse duration. Use that relationship only as a
+    # starting estimate; the rasterized waveform is always re-evaluated.
+    estimated_duration = (
+        raster_duration
+        * amplitude_t
+        / max_rf
+    )
+
+    n_raster = max(
+        1,
+        math.ceil(
+            estimated_duration / realization_raster
+            - 1e-12
+        ),
+    )
+
+    raster_duration = n_raster * realization_raster
+
+    amplitude_t = _sinc_rf_amplitude_t(
+        flip_angle=flip_angle,
+        duration=raster_duration,
+        gamma_hz_per_t=gamma_hz_per_t,
+        rf_raster_time=rf_raster_time,
+        time_bw_product=time_bw_product,
+        apodization=apodization,
+        center_pos=center_pos,
+    )
+
+    # Account for rasterization / envelope discretization.
+    while amplitude_t > max_rf:
+        raster_duration += realization_raster
+
+        amplitude_t = _sinc_rf_amplitude_t(
+            flip_angle=flip_angle,
+            duration=raster_duration,
+            gamma_hz_per_t=gamma_hz_per_t,
+            rf_raster_time=rf_raster_time,
+            time_bw_product=time_bw_product,
+            apodization=apodization,
+            center_pos=center_pos,
+        )
+
+    return raster_duration, amplitude_t
 
 
 def _sinc_rf_amplitude_t(
@@ -1938,7 +2276,7 @@ def _gauss_rf_amplitude_t(
 
 def _arbitrary_rf_peak_amplitude_t(
     *,
-    signal: list[float],
+    signal: list[complex],
     flip_angle: float,
     rf_raster_time: float,
     gamma_hz_per_t: float,
@@ -1946,30 +2284,59 @@ def _arbitrary_rf_peak_amplitude_t(
     """Return arbitrary RF peak B1 amplitude in tesla after flip-angle scaling."""
 
     if flip_angle <= 0:
-        raise ValueError(f"flip_angle must be positive. Passed: {flip_angle}")
-
-    if rf_raster_time <= 0:
-        raise ValueError(f"rf_raster_time must be positive. Passed: {rf_raster_time}")
-
-    if gamma_hz_per_t <= 0:
-        raise ValueError(f"gamma_hz_per_t must be positive. Passed: {gamma_hz_per_t}")
-
-    if not signal:
-        raise ValueError("signal must contain at least one sample.")
-
-    area = sum(signal) * rf_raster_time
-
-    if abs(area) <= 0:
         raise ValueError(
-            "Arbitrary RF signal has zero signed area and cannot be scaled to "
-            "the requested flip angle. Use a signal with nonzero integral."
+            f"flip_angle must be positive. Passed: {flip_angle}"
         )
 
-    scale_t = flip_angle / (2.0 * math.pi * gamma_hz_per_t * area)
-    peak_signal = max(abs(value) for value in signal)
+    if rf_raster_time <= 0:
+        raise ValueError(
+            f"rf_raster_time must be positive. Passed: {rf_raster_time}"
+        )
 
-    return abs(scale_t) * peak_signal
+    if gamma_hz_per_t <= 0:
+        raise ValueError(
+            f"gamma_hz_per_t must be positive. Passed: {gamma_hz_per_t}"
+        )
 
+    if not signal:
+        raise ValueError(
+            "signal must contain at least one sample."
+        )
+
+    complex_area = (
+        sum(signal)
+        * rf_raster_time
+    )
+
+    area_magnitude = abs(
+        complex_area
+    )
+
+    if area_magnitude <= 0:
+        raise ValueError(
+            "Arbitrary RF signal has zero complex integral and cannot be "
+            "scaled to the requested flip angle."
+        )
+
+    scale_t = (
+        flip_angle
+        / (
+            2.0
+            * math.pi
+            * gamma_hz_per_t
+            * area_magnitude
+        )
+    )
+
+    peak_signal = max(
+        abs(value)
+        for value in signal
+    )
+
+    return (
+        scale_t
+        * peak_signal
+    )
 
 def _normalized_sinc_envelope(
     *,
@@ -2076,54 +2443,84 @@ def _normalized_gauss_envelope(
     return t_values, envelope
 
 
-def _resample_real_signal_to_raster(
+def _resample_complex_signal_to_raster(
     *,
-    signal: list[float],
+    signal: list[complex],
     duration: float,
     rf_raster_time: float,
-) -> list[float]:
-    """Resample a real arbitrary RF envelope to the RF raster."""
+) -> list[complex]:
+    """Resample a complex arbitrary RF waveform to the RF raster."""
 
     if duration <= 0:
-        raise ValueError(f"duration must be positive. Passed: {duration}")
+        raise ValueError(
+            f"duration must be positive. Passed: {duration}"
+        )
 
     if rf_raster_time <= 0:
-        raise ValueError(f"rf_raster_time must be positive. Passed: {rf_raster_time}")
+        raise ValueError(
+            f"rf_raster_time must be positive. Passed: {rf_raster_time}"
+        )
 
     if not signal:
-        raise ValueError("signal must contain at least one sample.")
+        raise ValueError(
+            "signal must contain at least one sample."
+        )
 
-    target_count = int(round(duration / rf_raster_time))
+    target_count = int(
+        round(duration / rf_raster_time)
+    )
 
     if target_count < 1:
         raise ValueError(
             "RF duration is shorter than one RF raster sample. "
-            f"duration={duration}, rf_raster_time={rf_raster_time}"
+            f"duration={duration}, "
+            f"rf_raster_time={rf_raster_time}"
         )
 
     if len(signal) == target_count:
         return list(signal)
 
     if len(signal) == 1:
-        return [signal[0] for _ in range(target_count)]
+        return [
+            signal[0]
+            for _ in range(target_count)
+        ]
 
     if target_count == 1:
         return [signal[0]]
 
     input_last = len(signal) - 1
     output_last = target_count - 1
-    resampled: list[float] = []
+
+    resampled: list[complex] = []
 
     for out_index in range(target_count):
-        x = out_index * input_last / output_last
-        left = int(math.floor(x))
-        right = min(left + 1, input_last)
+        x = (
+            out_index
+            * input_last
+            / output_last
+        )
+
+        left = int(
+            math.floor(x)
+        )
+        right = min(
+            left + 1,
+            input_last,
+        )
+
         frac = x - left
-        value = (1.0 - frac) * signal[left] + frac * signal[right]
-        resampled.append(value)
+
+        value = (
+            (1.0 - frac) * signal[left]
+            + frac * signal[right]
+        )
+
+        resampled.append(
+            value
+        )
 
     return resampled
-
 
 def _sinc(x: float) -> float:
     """Return normalized sinc(x) = sin(pi*x)/(pi*x)."""
