@@ -38,6 +38,95 @@ from ._symbolic import (
 
 _EPS = 1e-12
 
+_LOGICAL_TO_CONSTRUCTION_CHANNEL = {
+    "read": "x",
+    "phase": "y",
+    "slice": "z",
+}
+_VALID_PHYSICAL_CHANNELS = frozenset({"x", "y", "z"})
+_VALID_LOGICAL_AXES = frozenset(_LOGICAL_TO_CONSTRUCTION_CHANNEL)
+
+
+def _normalize_optional_logical_axis(
+    value: str | None,
+    *,
+    field_name: str,
+) -> str | None:
+    """Normalize an optional logical gradient axis."""
+
+    if value is None:
+        return None
+
+    logical_axis = str(value).lower()
+    if logical_axis not in _VALID_LOGICAL_AXES:
+        raise ValueError(
+            f"{field_name} must be one of 'read', 'phase', or 'slice'. "
+            f"Passed: {value!r}"
+        )
+    return logical_axis
+
+
+def _resolve_gradient_channel(
+    channel: str | None,
+    *,
+    axis_role: str | None = None,
+    encoding_role: str | None = None,
+) -> tuple[str, bool]:
+    """Resolve the internal construction channel for a gradient.
+
+    Gradients may be authored either in a physical PyPulseq channel
+    (``x``, ``y``, ``z``) or in a logical PyPulseq-Star axis
+    (``read``, ``phase``, ``slice``).
+
+    When the physical channel is omitted, a canonical construction channel is
+    assigned internally. That channel is only a storage/construction detail;
+    the logical axis remains authoritative for geometry-aware realization.
+
+    Returns
+    -------
+    channel
+        Resolved internal x/y/z construction channel.
+    authored_logically
+        True when no physical channel was supplied by the caller.
+    """
+
+    normalized_axis_role = _normalize_optional_logical_axis(
+        axis_role,
+        field_name="axis_role",
+    )
+    normalized_encoding_role = _normalize_optional_logical_axis(
+        encoding_role,
+        field_name="encoding_role",
+    )
+
+    if (
+        normalized_axis_role is not None
+        and normalized_encoding_role is not None
+        and normalized_axis_role != normalized_encoding_role
+    ):
+        raise ValueError(
+            "axis_role and encoding_role must identify the same logical axis "
+            "when both are supplied."
+        )
+
+    if channel is not None:
+        resolved_channel = str(channel).lower()
+        if resolved_channel not in _VALID_PHYSICAL_CHANNELS:
+            raise ValueError(
+                "channel must be one of 'x', 'y', or 'z'. "
+                f"Passed: {channel!r}"
+            )
+        return resolved_channel, False
+
+    logical_axis = normalized_axis_role or normalized_encoding_role
+    if logical_axis is None:
+        raise ValueError(
+            "Gradient construction requires either a physical channel "
+            "('x', 'y', 'z') or a logical axis_role/encoding_role "
+            "('read', 'phase', 'slice')."
+        )
+
+    return _LOGICAL_TO_CONSTRUCTION_CHANNEL[logical_axis], True
 
 
 def _logical_gradient_metadata(
@@ -46,8 +135,28 @@ def _logical_gradient_metadata(
     axis_role: str | None,
     encoding_role: str | None,
     metadata: dict[str, Any] | None,
+    authored_logically: bool,
 ) -> tuple[str, str, dict[str, Any]]:
     """Normalize logical gradient metadata for all gradient constructors."""
+
+    axis_role = _normalize_optional_logical_axis(
+        axis_role,
+        field_name="axis_role",
+    )
+    encoding_role = _normalize_optional_logical_axis(
+        encoding_role,
+        field_name="encoding_role",
+    )
+
+    if (
+        axis_role is not None
+        and encoding_role is not None
+        and axis_role != encoding_role
+    ):
+        raise ValueError(
+            "axis_role and encoding_role must identify the same logical axis "
+            "when both are supplied."
+        )
 
     logical_axis = normalize_logical_axis(
         axis_role or encoding_role,
@@ -56,6 +165,12 @@ def _logical_gradient_metadata(
     out = dict(metadata or {})
     out.setdefault("logical_axis", logical_axis)
     out.setdefault("axis_role", logical_axis)
+    out.setdefault("encoding_role", logical_axis)
+    out.setdefault(
+        "gradient_coordinate_mode",
+        "logical" if authored_logically else "physical",
+    )
+    out.setdefault("construction_channel", channel)
     return logical_axis, logical_axis, out
 
 
@@ -119,7 +234,7 @@ def calculate_shortest_rise_time(amplitude: float, max_slew: float, grad_raster_
 
 
 def make_trapezoid(
-    channel: str,
+    channel: str | None = None,
     amplitude: float | None = None,
     area: float | None = None,
     delay: float = 0.0,
@@ -144,13 +259,25 @@ def make_trapezoid(
     The accepted input combinations intentionally follow PyPulseq's
     ``make_trapezoid`` behavior for the common cases: area-based, amplitude-
     based, and flat-area-based construction.
+
+    A gradient may be authored using either ``channel="x/y/z"`` or a logical
+    ``axis_role="read/phase/slice"``. When only a logical axis is supplied,
+    an internal construction channel is assigned while the logical axis is
+    retained as the authoritative geometry metadata.
     """
 
     if system is None:
         system = _default_system()
 
+    original_channel = channel
+    channel, authored_logically = _resolve_gradient_channel(
+        channel,
+        axis_role=axis_role,
+        encoding_role=encoding_role,
+    )
+
     constructor_specs = {
-        "channel": channel,
+        "channel": original_channel,
         "amplitude": amplitude,
         "area": area,
         "delay": delay,
@@ -254,18 +381,12 @@ def make_trapezoid(
     if max_slew is None:
         max_slew = _system_value(system, "max_slew", 120e6)
 
-    if channel not in {"x", "y", "z"}:
-        raise ValueError(f"Invalid channel. Must be one of 'x', 'y', or 'z'. Passed: {channel!r}")
-    if axis_role is not None and str(axis_role).lower() not in {"read", "phase", "slice"}:
-        raise ValueError("axis_role must be one of 'read', 'phase', or 'slice'.")
-    if encoding_role is not None and str(encoding_role).lower() not in {"read", "phase", "slice"}:
-        raise ValueError("encoding_role must be one of 'read', 'phase', or 'slice'.")
-
     axis_role, encoding_role, metadata = _logical_gradient_metadata(
         channel=channel,
         axis_role=axis_role,
         encoding_role=encoding_role,
         metadata=metadata,
+        authored_logically=authored_logically,
     )
 
     if rise_time is None and fall_time is not None:
@@ -427,8 +548,8 @@ def make_trapezoid(
 
 
 def make_arbitrary_grad(
-    channel: str,
-    waveform: np.ndarray | list[float],
+    channel: str | None = None,
+    waveform: np.ndarray | list[float] | None = None,
     first: float | None = None,
     last: float | None = None,
     delay: float = 0.0,
@@ -444,10 +565,25 @@ def make_arbitrary_grad(
     polarity: int | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> SeqStarGradientEvent:
-    """Create an enriched arbitrary gradient event."""
+    """Create an enriched arbitrary gradient event.
+
+    A gradient may be authored using either ``channel="x/y/z"`` or a logical
+    ``axis_role="read/phase/slice"``. When only a logical axis is supplied,
+    an internal construction channel is assigned while the logical axis is
+    retained as the authoritative geometry metadata.
+    """
+
+    if waveform is None:
+        raise ValueError("waveform must be provided for make_arbitrary_grad().")
 
     if system is None:
         system = _default_system()
+
+    channel, authored_logically = _resolve_gradient_channel(
+        channel,
+        axis_role=axis_role,
+        encoding_role=encoding_role,
+    )
 
     symbolic_event_specs = symbolic_specs(
         first=first,
@@ -467,19 +603,12 @@ def make_arbitrary_grad(
     if max_slew is None or max_slew == 0:
         max_slew = _system_value(system, "max_slew", 120e6)
 
-    if channel not in {"x", "y", "z"}:
-        raise ValueError(f"Invalid channel. Must be one of 'x', 'y', or 'z'. Passed: {channel!r}")
-
-    if axis_role is not None and str(axis_role).lower() not in {"read", "phase", "slice"}:
-        raise ValueError("axis_role must be one of 'read', 'phase', or 'slice'.")
-    if encoding_role is not None and str(encoding_role).lower() not in {"read", "phase", "slice"}:
-        raise ValueError("encoding_role must be one of 'read', 'phase', or 'slice'.")
-
     axis_role, encoding_role, metadata = _logical_gradient_metadata(
         channel=channel,
         axis_role=axis_role,
         encoding_role=encoding_role,
         metadata=metadata,
+        authored_logically=authored_logically,
     )
 
     delay = _round_to_raster(delay, grad_raster_time)
@@ -519,6 +648,8 @@ def split_gradient(
     system: Any | None = None,
     *,
     name: str | None = None,
+    axis_role: str | None = None,
+    encoding_role: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> tuple[SeqStarGradientEvent, SeqStarGradientEvent, SeqStarGradientEvent]:
     """Split a trapezoidal gradient into ramp-up, flat-top, and ramp-down events.
@@ -545,9 +676,23 @@ def split_gradient(
 
     amp = parent.amplitude
 
+    split_axis_role = axis_role or grad.axis_role
+    split_encoding_role = encoding_role or grad.encoding_role
+    parent_coordinate_mode = str(
+        getattr(grad, "metadata", {}).get("gradient_coordinate_mode", "physical")
+    ).lower()
+
     def _two_sample_part(samples: list[float], part_delay: float, part_name: str) -> SeqStarGradientEvent:
+        # Preserve logical authoring semantics across split parts. A physical
+        # construction channel is passed only when the parent was physically
+        # authored; logical parents are reconstructed from their logical role.
+        split_channel = (
+            None
+            if parent_coordinate_mode == "logical"
+            else parent.channel
+        )
         return make_arbitrary_grad(
-            channel=parent.channel,
+            channel=split_channel,
             waveform=np.asarray(samples, dtype=float),
             first=samples[0],
             last=samples[-1],
@@ -555,8 +700,8 @@ def split_gradient(
             system=system,
             name=part_name,
             role=grad.role,
-            axis_role=grad.axis_role,
-            encoding_role=grad.encoding_role,
+            axis_role=split_axis_role,
+            encoding_role=split_encoding_role,
             polarity=grad.polarity,
             metadata={**grad.metadata, **dict(metadata or {}), "split_parent": grad.name},
         )

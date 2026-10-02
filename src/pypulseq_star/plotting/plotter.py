@@ -119,8 +119,10 @@ class SeqStarPlotter:
 
         blocks = list(_iter_blocks(self.seq))
 
+        selected_tr_node: str | None = None
+
         if one_tr:
-            time_range = self._first_tr_range(blocks)
+            selected_tr_node, time_range = self._first_tr_selection(blocks)
 
         # Resolve relationships before plotting when the sequence exposes the
         # relationship API. Plotting remains read-only; failures fall back to
@@ -215,6 +217,7 @@ class SeqStarPlotter:
         _expand_rendered_node_repetitions(
             self.seq,
             rendered,
+            selected_root=selected_tr_node if one_tr else None,
         )
 
         # Normalize RF amplitudes once across the complete rendered sequence.
@@ -561,46 +564,335 @@ class SeqStarPlotter:
 
         return rendered_event
 
-    def _first_tr_range(self, blocks: list[Any]) -> tuple[float, float]:
-        """Return a useful first-TR range."""
+    def _first_tr_range(
+        self,
+        blocks: list[Any],
+    ) -> tuple[float, float]:
+        """Return the first logical repetition/TR range."""
+
+        _, time_range = self._first_tr_selection(blocks)
+        return time_range
+
+    def _first_tr_selection(
+        self,
+        blocks: list[Any],
+    ) -> tuple[str | None, tuple[float, float]]:
+        """Return the first repeated node and its logical TR range.
+
+        SeqStar repeat-node metadata is authoritative when available. This allows
+        ``one_tr=True`` to select one complete logical repetition and to exclude
+        later repeated acquisition families that happen to occur inside the same
+        numeric time window on the compact authored timeline.
+
+        Legacy repetition/TR metadata remains supported as a fallback.
+        """
+
+        def resolve_numeric(value: Any) -> float | None:
+            if value is None:
+                return None
+
+            # Relationship-aware values such as ParameterRef / Expression.
+            if hasattr(value, "eval"):
+                try:
+                    value = value.eval(self.seq)
+                except Exception:
+                    return None
+
+            # Permit a node field to refer to a protocol parameter by name.
+            if isinstance(value, str):
+                protocol = getattr(
+                    self.seq,
+                    "protocol",
+                    None,
+                )
+
+                parameters = getattr(
+                    protocol,
+                    "parameters",
+                    None,
+                )
+
+                if isinstance(parameters, Mapping) and value in parameters:
+                    value = parameters[value]
+
+                    if hasattr(value, "eval"):
+                        try:
+                            value = value.eval(self.seq)
+                        except Exception:
+                            return None
+
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return None
+
+            if not math.isfinite(numeric):
+                return None
+
+            return numeric
+
+        # ------------------------------------------------------------------
+        # 1. Prefer the SeqStar node hierarchy.
+        #
+        # Choose the outermost repeated node. This matters for sequences that
+        # contain nested repeated structures, e.g. a TR containing an echo train.
+        # ``one_tr`` should select the outer repetition, not one echo spacing.
+        # ------------------------------------------------------------------
+
+        nodes = getattr(
+            getattr(
+                self.seq,
+                "timeline",
+                None,
+            ),
+            "nodes",
+            None,
+        )
+
+        if not isinstance(nodes, Mapping):
+            metadata = getattr(
+                self.seq,
+                "metadata",
+                None,
+            )
+
+            if isinstance(metadata, Mapping):
+                nodes = metadata.get(
+                    "seqstar_nodes",
+                )
+
+        candidates: list[
+            tuple[int, int, str, float]
+        ] = []
+
+        if isinstance(nodes, Mapping):
+            for order, (node_name, record) in enumerate(
+                nodes.items()
+            ):
+                if not isinstance(record, Mapping):
+                    continue
+
+                repeat_every = resolve_numeric(
+                    record.get(
+                        "repeat_every"
+                    )
+                )
+
+                if (
+                    repeat_every is None
+                    or repeat_every <= 0
+                ):
+                    continue
+
+                node_name = str(
+                    node_name
+                )
+
+                depth = node_name.count(
+                    "."
+                )
+
+                candidates.append(
+                    (
+                        depth,
+                        order,
+                        node_name,
+                        repeat_every,
+                    )
+                )
+
+        if candidates:
+            _, _, repeat_node, repeat_every = min(
+                candidates,
+                key=lambda item: (
+                    item[0],
+                    item[1],
+                ),
+            )
+
+            current_time = 0.0
+
+            for block_index, block in enumerate(blocks):
+                explicit_start = _get_block_tstart(
+                    block
+                )
+
+                block_start = (
+                    explicit_start
+                    if explicit_start is not None
+                    else current_time
+                )
+
+                block_node = _block_node_name(
+                    block,
+                    block_index,
+                )
+
+                if _plot_node_within(
+                    block_node,
+                    repeat_node,
+                ):
+                    return (
+                        repeat_node,
+                        (
+                            block_start,
+                            block_start + repeat_every,
+                        ),
+                    )
+
+                block_end = (
+                    block_start
+                    + calc_duration(block)
+                )
+
+                current_time = max(
+                    current_time,
+                    block_end,
+                )
+
+        # ------------------------------------------------------------------
+        # 2. Block-level SeqStar repeat metadata fallback.
+        # ------------------------------------------------------------------
+
+        current_time = 0.0
+
+        for block_index, block in enumerate(blocks):
+            explicit_start = _get_block_tstart(
+                block
+            )
+
+            block_start = (
+                explicit_start
+                if explicit_start is not None
+                else current_time
+            )
+
+            repeat_every = resolve_numeric(
+                _get_from_parameters(
+                    block,
+                    keys=(
+                        "seqstar_repeat_every",
+                    ),
+                    default=None,
+                )
+            )
+
+            if (
+                repeat_every is not None
+                and repeat_every > 0
+            ):
+                repeat_node = _block_repeat_parent(block)
+                if repeat_node is None:
+                    repeat_node = _block_node_name(
+                        block,
+                        block_index,
+                    )
+
+                return (
+                    repeat_node,
+                    (
+                        block_start,
+                        block_start + repeat_every,
+                    ),
+                )
+
+            block_end = (
+                block_start
+                + calc_duration(block)
+            )
+
+            current_time = max(
+                current_time,
+                block_end,
+            )
+
+        # ------------------------------------------------------------------
+        # 3. Preserve existing legacy PyPulseq-Star behavior.
+        # ------------------------------------------------------------------
 
         for block in blocks:
             repetitions = _get_int_from_parameters(
                 block,
-                keys=("repetitions", "average", "averages", "n_avg", "num_averages"),
+                keys=(
+                    "repetitions",
+                    "average",
+                    "averages",
+                    "n_avg",
+                    "num_averages",
+                ),
                 default=_get_int_from_parameters(
                     self.seq,
-                    keys=("repetitions", "average", "averages", "n_avg", "num_averages"),
+                    keys=(
+                        "repetitions",
+                        "average",
+                        "averages",
+                        "n_avg",
+                        "num_averages",
+                    ),
                     default=1,
                 ),
             )
+
             repetition_time = _get_float_from_parameters(
                 block,
-                keys=("repetition_time", "TR", "tr"),
+                keys=(
+                    "repetition_time",
+                    "TR",
+                    "tr",
+                ),
                 default=_get_float_from_parameters(
                     self.seq,
-                    keys=("repetition_time", "TR", "tr"),
+                    keys=(
+                        "repetition_time",
+                        "TR",
+                        "tr",
+                    ),
                     default=None,
                 ),
             )
-            if repetitions > 1 and repetition_time is not None and repetition_time > 0:
-                start = _get_block_tstart(block)
+
+            if (
+                repetitions > 1
+                and repetition_time is not None
+                and repetition_time > 0
+            ):
+                start = _get_block_tstart(
+                    block
+                )
+
                 if start is None:
                     start = 0.0
-                return (start, start + repetition_time)
 
-        sequence_tr = _get_float_from_parameters(
-            self.seq,
-            keys=("repetition_time", "TR", "tr"),
-            default=None,
+                return (
+                    None,
+                    (
+                        start,
+                        start + repetition_time,
+                    ),
+                )
+
+        # ------------------------------------------------------------------
+        # 4. Final fallback for sequences with no repetition information.
+        # ------------------------------------------------------------------
+
+        duration = (
+            calc_duration(blocks[0])
+            if blocks
+            else 1e-3
         )
-        if sequence_tr is not None and sequence_tr > 0:
-            return (0.0, sequence_tr)
 
-        duration = calc_duration(blocks[0]) if blocks else 1e-3
-        return (0.0, max(duration, 1e-6))
+        return (
+            None,
+            (
+                0.0,
+                max(
+                    duration,
+                    1e-6,
+                ),
+            ),
+        )
 
-  
+
     @staticmethod
     def _plot_render(
         render: dict[str, Any],
@@ -724,6 +1016,8 @@ def plot(
 def _expand_rendered_node_repetitions(
     seq: Any,
     render: dict[str, Any],
+    *,
+    selected_root: str | None = None,
 ) -> None:
     """Expand nested logical Loop nodes recursively for visualization.
 
@@ -762,10 +1056,24 @@ def _expand_rendered_node_repetitions(
     if not repeated:
         return
 
-    repeated_names = sorted(
+    all_repeated_names = sorted(
         repeated,
         key=lambda name: (_plot_node_depth(name), name),
     )
+
+    repeated_names = all_repeated_names
+    if selected_root is not None:
+        repeated_names = [
+            name
+            for name in all_repeated_names
+            if (
+                name == selected_root
+                or _plot_node_within(name, selected_root)
+            )
+        ]
+
+        if not repeated_names:
+            return
 
     def repeated_parent(node_name: str) -> str | None:
         ancestors = [
@@ -809,7 +1117,7 @@ def _expand_rendered_node_repetitions(
             continue
         if any(
             _rendered_block_belongs_to_node(block, node_name)
-            for node_name in repeated_names
+            for node_name in all_repeated_names
         ):
             repeated_block_indices.add(index)
 

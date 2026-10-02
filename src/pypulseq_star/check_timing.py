@@ -601,6 +601,9 @@ def _get_event_dwell(event: Any) -> float | None:
 def _get_required_pre_dead_time(event: Any, system: Any) -> float:
     """Return required pre-event dead time."""
 
+    if _is_gradient(event) or _is_delay(event):
+        return 0.0
+
     # Generic keys first.
     for key in ("pre_dead_time", "dead_time_before", "required_delay"):
         value = _get_timing_value(event, key)
@@ -624,6 +627,9 @@ def _get_required_pre_dead_time(event: Any, system: Any) -> float:
 
 def _get_required_post_dead_time(event: Any, system: Any) -> float:
     """Return required post-event protected time."""
+
+    if _is_gradient(event) or _is_delay(event):
+        return 0.0
 
     for key in (
         "post_dead_time",
@@ -726,24 +732,36 @@ def _div_check(
 
 
 def _is_rf(event: Any) -> bool:
-    """Return True if event is RF-like."""
+    """Return True only for explicitly RF-like events."""
 
-    event_type = str(getattr(event, "type", "")).lower()
-    kind = str(getattr(event, "kind", "")).lower()
-    role = str(getattr(event, "role", "")).lower()
-    use = str(getattr(event, "use", "")).lower()
+    # Explicit non-RF event families take precedence.
+    if _is_gradient(event) or _is_delay(event):
+        return False
+
+    event_type = str(
+        getattr(event, "event_type", getattr(event, "type", "")) or ""
+    ).lower()
+    kind = str(getattr(event, "kind", "") or "").lower()
+    role = str(getattr(event, "role", "") or "").lower()
+    use = str(getattr(event, "use", "") or "").lower()
     class_name = event.__class__.__name__.lower()
-    name = str(getattr(event, "name", "")).lower()
 
-    return (
-        event_type == "rf"
-        or kind.startswith("rf")
-        or role in {"rf", "excitation", "refocusing", "inversion"}
-        or use in {"rf", "excitation", "refocusing", "inversion"}
-        or "rf" in class_name
-        or "rf" in name
-        or hasattr(event, "flip_angle")
-    )
+    if event_type == "rf":
+        return True
+
+    if kind.startswith("rf"):
+        return True
+
+    if "rfevent" in class_name or "rfblockevent" in class_name:
+        return True
+
+    if role in {"rf", "excitation", "refocusing", "inversion", "saturation"}:
+        return True
+
+    if use in {"rf", "excitation", "refocusing", "inversion", "saturation"}:
+        return True
+
+    return getattr(event, "flip_angle", None) is not None
 
 
 def _is_adc(event: Any) -> bool:

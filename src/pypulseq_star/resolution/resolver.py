@@ -406,6 +406,15 @@ def _rebuild_symbolic_constructors(sequence: Any) -> None:
                     block_index=block_index,
                     event_index=event_index,
                 )
+            elif family == "sinc":
+                _rebuild_sinc_rf_event(
+                    event,
+                    constructor=constructor,
+                    sequence=sequence,
+                    block=block,
+                    block_index=block_index,
+                    event_index=event_index,
+                )
 
 
 def _symbolic_constructor(event: Any) -> dict[str, Any] | None:
@@ -480,7 +489,11 @@ def _rebuild_trapezoid_event(
 
     try:
         rebuilt = make_trapezoid(
-            channel=str(specs["channel"]),
+            channel=(
+                None
+                if specs.get("channel") is None
+                else str(specs["channel"])
+            ),
             amplitude=specs.get("amplitude"),
             area=specs.get("area"),
             delay=specs.get("delay", 0.0),
@@ -599,6 +612,268 @@ def _rebuild_trapezoid_event(
         except Exception:
             pass
 
+
+
+
+def _rebuild_sinc_rf_event(
+    event: Any,
+    *,
+    constructor: Mapping[str, Any],
+    sequence: Any,
+    block: Any | None = None,
+    block_index: int | None = None,
+    event_index: int | None = None,
+) -> None:
+    """Reconstruct one sinc RF event from its resolved scientific inputs.
+
+    Sinc RF realization can depend on scanner hardware limits. In particular,
+    ``rf_constraint_policy="stretch"`` may lengthen the pulse so that its peak
+    B1 does not exceed ``system.max_rf``. Applying a symbolic duration directly
+    to an already-realized RF event would undo that adaptation. Rebuilding here
+    restores a self-consistent event/shape realization after protocol
+    expressions have resolved.
+    """
+
+    from pypulseq_star.make.rf import make_sinc_pulse
+
+    raw_specs = constructor.get("specs", {})
+    if not isinstance(raw_specs, Mapping):
+        return
+
+    # Constructor records may contain a hardware-realized numeric duration,
+    # while symbolic_properties retains the authored protocol expression.
+    # Overlay symbolic constructor inputs before evaluation so a new
+    # realization remains responsive to protocol overrides.
+    merged_specs = dict(raw_specs)
+    symbolic = _symbolic_specs(event)
+    for key in (
+        "flip_angle",
+        "duration",
+        "phase_offset",
+        "freq_offset",
+        "time_bw_product",
+        "apodization",
+        "center_pos",
+        "delay",
+        "slice_thickness",
+    ):
+        value = symbolic.get(key)
+        if isinstance(value, Expression):
+            merged_specs[key] = value
+
+    specs = {
+        key: _resolve_constructor_value(value, sequence)
+        for key, value in merged_specs.items()
+    }
+
+    system = (
+        getattr(event, "system", None)
+        or getattr(sequence, "system", None)
+    )
+
+    if system is None:
+        raise ValueError(
+            "Cannot rebuild symbolic sinc RF event without scanner system limits."
+        )
+
+    event_name = (
+        specs.get("name")
+        or getattr(event, "name", None)
+        or _metadata_value(event, "source_event_name", None)
+        or "rf"
+    )
+
+    try:
+        rebuilt = make_sinc_pulse(
+            flip_angle=specs.get("flip_angle"),
+            duration=specs.get("duration"),
+            name=str(event_name),
+            use=specs.get("use") or getattr(event, "use", None),
+            phase_offset=specs.get("phase_offset"),
+            freq_offset=specs.get("freq_offset"),
+            time_bw_product=specs.get("time_bw_product"),
+            apodization=specs.get("apodization"),
+            center_pos=specs.get("center_pos"),
+            rf_constraint_policy=str(
+                specs.get("rf_constraint_policy", "strict")
+            ),
+            delay=specs.get("delay"),
+            system=system,
+            parameters=getattr(sequence, "parameters", None),
+            slice_thickness=specs.get("slice_thickness"),
+            max_grad=specs.get("max_grad"),
+            max_slew=specs.get("max_slew"),
+            return_gz=False,
+            channel=specs.get("channel"),
+            axis_role=(
+                specs.get("axis_role")
+                or getattr(event, "axis_role", None)
+            ),
+            gz_name=specs.get("gz_name"),
+            gzr_name=specs.get("gzr_name"),
+        )
+    except (ValueError, NotImplementedError) as exc:
+        block_name = (
+            getattr(block, "name", None)
+            if block is not None
+            else None
+        ) or "<unnamed block>"
+
+        location_parts = [f"block={block_name!r}"]
+        if block_index is not None:
+            location_parts.append(f"block_index={block_index}")
+        if event_index is not None:
+            location_parts.append(f"event_index={event_index}")
+
+        raise ValueError(
+            "Failed to rebuild symbolic sinc RF during sequence resolution. "
+            f"event={str(event_name)!r}, "
+            f"{', '.join(location_parts)}, "
+            f"duration={specs.get('duration')!r}, "
+            f"flip_angle={specs.get('flip_angle')!r}, "
+            f"time_bw_product={specs.get('time_bw_product')!r}, "
+            f"rf_constraint_policy={specs.get('rf_constraint_policy', 'strict')!r}, "
+            f"system.max_rf={getattr(system, 'max_rf', None)!r}. "
+            f"Underlying error: {exc}"
+        ) from exc
+
+    # Keep the original symbolic/provenance stores, but replace all realized
+    # RF geometry/timing with the freshly hardware-constrained realization.
+    original_metadata = getattr(event, "metadata", None)
+    preserved_metadata = (
+        dict(original_metadata)
+        if isinstance(original_metadata, Mapping)
+        else {}
+    )
+
+    original_parameters = getattr(event, "parameters", None)
+    preserved_parameters = (
+        dict(original_parameters)
+        if isinstance(original_parameters, Mapping)
+        else {}
+    )
+
+    rebuilt_shape = getattr(rebuilt, "shape", None)
+    if rebuilt_shape is not None:
+        try:
+            event.shape = rebuilt_shape
+        except Exception:
+            pass
+
+    for property_name in (
+        "flip_angle",
+        "duration",
+        "phase_offset",
+        "freq_offset",
+        "frequency_offset",
+        "use",
+        "role",
+        "delay",
+    ):
+        try:
+            value = getattr(rebuilt, property_name)
+        except Exception:
+            continue
+        try:
+            setattr(event, property_name, value)
+        except Exception:
+            pass
+
+    rebuilt_parameters = getattr(rebuilt, "parameters", None)
+    event_parameters = getattr(event, "parameters", None)
+    if isinstance(event_parameters, dict):
+        if isinstance(rebuilt_parameters, Mapping):
+            for key, value in rebuilt_parameters.items():
+                if not str(key).startswith("_symbolic"):
+                    event_parameters[key] = value
+
+        # Retain source expressions/constructor intent for provenance.
+        for key, value in preserved_parameters.items():
+            if str(key).startswith("_symbolic"):
+                event_parameters[key] = value
+
+        event_parameters.setdefault(
+            "resolved_symbolic_constructor",
+            {},
+        ).update(
+            {
+                "family": "sinc",
+                "duration": getattr(event, "duration", None),
+                "flip_angle": getattr(event, "flip_angle", None),
+                "time_bw_product": (
+                    getattr(rebuilt_shape, "time_bw_product", None)
+                    if rebuilt_shape is not None
+                    else specs.get("time_bw_product")
+                ),
+                "rf_constraint_policy": specs.get(
+                    "rf_constraint_policy",
+                    "strict",
+                ),
+                "max_rf": getattr(system, "max_rf", None),
+            }
+        )
+
+    if isinstance(original_metadata, dict):
+        rebuilt_metadata = getattr(rebuilt, "metadata", None)
+        if isinstance(rebuilt_metadata, Mapping):
+            for key, value in rebuilt_metadata.items():
+                if key not in {
+                    "symbolic_constructor",
+                    "symbolic_properties",
+                    "symbolic_placeholders",
+                    "resolved_symbolic_properties",
+                }:
+                    original_metadata[key] = value
+
+        # Preserve source-side symbolic relationships and provenance.
+        for key in (
+            "symbolic_constructor",
+            "symbolic_properties",
+            "symbolic_placeholders",
+            "resolved_symbolic_properties",
+            "sequence_event_path",
+            "source_event_name",
+        ):
+            if key in preserved_metadata:
+                original_metadata[key] = preserved_metadata[key]
+
+        original_metadata.setdefault(
+            "resolved_symbolic_constructor",
+            {},
+        ).update(
+            {
+                "family": "sinc",
+                "duration": getattr(event, "duration", None),
+                "flip_angle": getattr(event, "flip_angle", None),
+                "time_bw_product": (
+                    getattr(rebuilt_shape, "time_bw_product", None)
+                    if rebuilt_shape is not None
+                    else specs.get("time_bw_product")
+                ),
+                "rf_constraint_policy": specs.get(
+                    "rf_constraint_policy",
+                    "strict",
+                ),
+                "max_rf": getattr(system, "max_rf", None),
+            }
+        )
+
+    timing = getattr(event, "timing", None)
+    rebuilt_timing = getattr(rebuilt, "timing", None)
+    if timing is not None:
+        if rebuilt_timing is not None:
+            for attr in ("tstart", "delay", "duration", "tend"):
+                try:
+                    setattr(timing, attr, getattr(rebuilt_timing, attr))
+                except Exception:
+                    pass
+        else:
+            try:
+                timing.duration = float(
+                    getattr(event, "duration", 0.0) or 0.0
+                )
+            except Exception:
+                pass
 
 
 def _trapezoid_rebuild_error_message(
