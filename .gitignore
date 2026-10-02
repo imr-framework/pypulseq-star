@@ -8,6 +8,7 @@ __pycache__/
 .pyre/
 .pytype/
 .hypothesis/
+__MACOSX/
 
 # Virtual environments
 .venv/
@@ -71,6 +72,19 @@ outputs/
 *.png
 *.svg
 *.pdf
+/data/
+
+# Keep curated regression-test sequence fixtures
+!tests/sequences/*.seq
+!tests/sequences/*.seq.json
+
+# Keep source-controlled package resources and documentation assets
+!src/pypulseq_star/**/*.json
+!src/pypulseq_star/**/*.svg
+!docs/**/*.png
+!docs/**/*.svg
+!docs/**/*.pdf
+!examples/**/*.json
 
 # Keep source-controlled package resources and documentation assets
 !src/pypulseq_star/**/*.json
