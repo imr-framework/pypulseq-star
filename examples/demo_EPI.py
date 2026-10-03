@@ -107,12 +107,13 @@ def define_system_limits() -> ppstar.Opts:
         slew_unit="mT/m/ms",
         rf_ringdown_time=20e-6,
         rf_dead_time=500e-6,
-        adc_dead_time=50e-6,
+        adc_dead_time=120e-6,
         rf_raster_time=2e-6,
         grad_raster_time=10e-6,
         block_duration_raster=10e-6,
-        adc_raster_time=100e-9,
+        adc_raster_time=1e-6,
         gamma=42.575575e6,
+        max_rf=15e-6,
     )
 
 
@@ -134,7 +135,7 @@ def define_protocol(*, orientation: str = ORIENTATION, overrides: dict[str, obje
             "flip_angle": 90.0,
             "rf_duration": 3e-3,
             "echo_time": 30e-3,
-            "repetition_time": 250e-3,
+            "repetition_time": 400e-3,
             "readout_duration": 640e-6,
             "adc_guard_time": 10e-6,
             "readout_ramp_time": 90e-6,

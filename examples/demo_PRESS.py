@@ -125,16 +125,19 @@ def define_system() -> ppstar.Opts:
     """Return representative generic scanner limits."""
 
     return ppstar.Opts(
-        max_grad=28,
+        max_grad=28.0,
         grad_unit="mT/m",
-        max_slew=150,
+        max_slew=120.0,
         slew_unit="T/m/s",
-        max_rf=15e-6,
         rf_ringdown_time=20e-6,
         rf_dead_time=100e-6,
-        adc_dead_time=10e-6,
+        adc_dead_time=100e-6,
         rf_raster_time=2e-6,
         grad_raster_time=10e-6,
+        block_duration_raster=10e-6,
+        adc_raster_time=1e-6,
+        gamma=42.575575e6,
+        max_rf = 15e-6,
     )
 
 
