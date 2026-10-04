@@ -814,26 +814,20 @@ class GenericGammaStarDocumentBuilder:
         *,
         params: dict[str, Any],
     ) -> None:
-        """Export live protocol bindings from trapezoid constructors.
+        """Export protocol-driven area bindings from trapezoid constructors.
 
-        A gradient can depend on protocol values without participating in a
-        loop variation.  GRE spoilers are the canonical example::
+        The defining constructor contract, rather than the resolved default
+        waveform, determines how a protocol edit is lowered:
 
-            gx_spoil.area = 2 * n_x / fov
-            gy_spoil.area = 2 * n_y / fov
+        * ``area`` with no authored timing is re-realized as the shortest
+          feasible trapezoid, so its duration remains live.
+        * ``area`` with explicit ``rise_time + flat_time + fall_time`` preserves
+          that authored shape/timing and scales only the waveform amplitude.
+        * Other constructor modes are left at their resolved representation
+          unless another writer pass (for example ``node.vary``) owns them.
 
-        Resolution correctly rebuilds those gradients locally, but the generic
-        gammaSTAR document previously serialized the rebuilt waveform as a
-        literal.  Consequently, changing FOV on the gammaSTAR website updated
-        the phase-encode prephaser (which is exported through ``node.vary``) but
-        left the spoilers unchanged.
-
-        This pass recognizes area-only symbolic trapezoid constructors and
-        emits a protocol-driven shortest feasible trapezoid.  It also propagates
-        the dynamic duration into the event container and source block so later
-        blocks remain correctly positioned.  Explicitly varied gradients are
-        skipped because ``_apply_single_loop_variations_and_bindings`` already
-        owns their exported relationship.
+        This policy is sequence-agnostic and prevents a resolved provisional
+        waveform from erasing the developer's original intent.
         """
 
         affected_blocks: set[int] = set()
@@ -870,50 +864,42 @@ class GenericGammaStarDocumentBuilder:
                 continue
 
             area_spec = specs.get("area")
-            # Only promote constructor expressions that are driven entirely by
-            # protocol parameters. EventPropertyRef / anchor / block references
-            # are valid local symbolic expressions, but they cannot be compiled
-            # as root.prot relationships without first mapping them to exported
-            # event paths. Those expressions must retain the already-resolved
-            # literal waveform rather than aborting the whole gammaSTAR export.
             if not _contains_parameter_reference(area_spec):
                 continue
             if _contains_non_protocol_reference(area_spec):
                 continue
 
-            # A node.vary(..., attribute="area") relationship has already
-            # replaced this parameter.  Do not overwrite that stronger,
-            # counter-dependent binding.
+            # A loop variation already owns this event property.
             if f"{leaf}.seqstar_variation_attribute" in params:
                 continue
 
-            # This implementation intentionally targets the common, generic
-            # area-only shortest-trapezoid constructor.  Fixed-duration or
-            # explicitly shaped trapezoids need a different feasibility model
-            # and remain serialized exactly as resolved.
-            if any(
-                specs.get(name) is not None
-                for name in (
-                    "amplitude",
-                    "duration",
-                    "fall_time",
-                    "flat_area",
-                    "flat_time",
-                    "rise_time",
-                )
-            ):
+            # Only an area-defined trapezoid is handled in this pass.  A
+            # simultaneously authored amplitude/flat_area would make ownership
+            # ambiguous and should remain at the resolved fallback.
+            if specs.get("amplitude") is not None or specs.get("flat_area") is not None:
+                continue
+
+            timing_fields = {
+                name
+                for name in ("duration", "rise_time", "flat_time", "fall_time")
+                if specs.get(name) is not None
+            }
+            shortest_time = not timing_fields
+            fixed_shape = {
+                "rise_time",
+                "flat_time",
+                "fall_time",
+            }.issubset(timing_fields)
+
+            # Duration-only and partially specified timing constructors require
+            # a separate constrained re-realization model.  Preserve the
+            # already-resolved waveform rather than guessing.
+            if not shortest_time and not fixed_shape:
                 continue
 
             area_inputs: dict[str, str] = {}
             source_to_name: dict[str, str] = {}
             try:
-                # Inline derived protocol parameters into the backend-consumed
-                # area target. gammaSTAR's interactive editor does not reliably
-                # invalidate transitive chains such as
-                # fov -> phase_encode_step -> spoiler.area -> spoiler.samples.
-                # The same generic compiler is already used for node.vary()
-                # targets and expands derived ParameterRef values to their
-                # primitive editable protocol controls.
                 area_body = self._variation_value_lua_expression(
                     area_spec,
                     inputs=area_inputs,
@@ -921,10 +907,6 @@ class GenericGammaStarDocumentBuilder:
                     target_path=f"{leaf}.area",
                 )
             except TypeError as exc:
-                # A generic writer enhancement must never make a previously
-                # exportable sequence fail. Unsupported symbolic reference
-                # forms are left as the resolved literal waveform and recorded
-                # for diagnostics.
                 warnings = getattr(
                     self,
                     "_symbolic_trapezoid_binding_warnings",
@@ -939,14 +921,73 @@ class GenericGammaStarDocumentBuilder:
                 )
                 self._symbolic_trapezoid_binding_warnings = warnings
                 continue
+
             params[f"{leaf}.area"] = _expr(
                 inputs=area_inputs,
                 script=f"return {area_body}",
             )
 
-            # Reproduce calculate_shortest_params_for_area() in gammaSTAR
-            # units.  Constructor area is in Hz/m*s (cycles/m); gammaSTAR
-            # waveform amplitudes are T/m, hence the division by gamma.
+            if fixed_shape:
+                # Keep the scanner/developer-authored timing exactly as
+                # resolved and make only amplitude live.  Normalize the current
+                # resolved waveform by its current area; this supports any
+                # fixed trapezoid timing without sequence-specific formulas.
+                grad_data = self._gradient_waveform_data(
+                    gradient_event=event
+                )
+                samples = grad_data.get("samples") or {}
+                times = [float(value) for value in samples.get("t", [])]
+                values = [float(value) for value in samples.get("v", [])]
+                reference_area = float(grad_data.get("area") or 0.0)
+
+                if (
+                    not times
+                    or len(times) != len(values)
+                    or abs(reference_area) < 1e-20
+                ):
+                    # A zero-area default cannot be normalized safely.  Keep
+                    # the resolved waveform rather than inventing a shape.
+                    continue
+
+                normalized_values = [
+                    value / reference_area
+                    for value in values
+                ]
+                normalized_path = f"{leaf}.seqstar_normalized_samples"
+                params[normalized_path] = _literal(
+                    {"t": times, "v": normalized_values}
+                )
+                params[f"{leaf}.samples"] = _expr(
+                    inputs={
+                        "shape": normalized_path,
+                        "area": f"{leaf}.area",
+                    },
+                    script=(
+                        "local out = {t=shape.t, v={}}\n"
+                        "for i=1,#shape.v do out.v[i] = shape.v[i] * area end\n"
+                        "return out"
+                    ),
+                )
+                params[f"{leaf}.max_abs_amplitude"] = _expr(
+                    inputs={"samples": f"{leaf}.samples"},
+                    script=(
+                        "local maxv = 0.0\n"
+                        "if samples == nil or samples.v == nil then return maxv end\n"
+                        "for i=1,#samples.v do\n"
+                        "  local value = math.abs(samples.v[i])\n"
+                        "  if value > maxv then maxv = value end\n"
+                        "end\n"
+                        "return maxv"
+                    ),
+                )
+                # Duration/container/block timing deliberately remain the
+                # existing resolved literals: fixed-shape area edits change
+                # amplitude, not timing.
+                continue
+
+            # Area-only constructor: preserve the existing generic shortest-time
+            # re-realization model and propagate its live duration through the
+            # source block.
             params[f"{leaf}.samples"] = _expr(
                 inputs={
                     "area": f"{leaf}.area",
@@ -1012,9 +1053,6 @@ class GenericGammaStarDocumentBuilder:
         if not affected_blocks:
             return
 
-        # Recompute affected source-block extents from the live event starts and
-        # durations.  Grouping later rewrites the event paths while preserving
-        # these dependencies.
         records_by_index = {
             int(record["index"]): record
             for record in self._block_export_records
@@ -1052,9 +1090,6 @@ class GenericGammaStarDocumentBuilder:
                 script="\n".join(lines),
             )
 
-        # Preserve the requested TR when a protocol edit lengthens a late block
-        # such as GRE spoiling.  The repetition-fill block starts after all
-        # preceding blocks, so its duration is simply TR minus its live tstart.
         for record in self._block_export_records:
             role = str(
                 _block_role(record["block"])

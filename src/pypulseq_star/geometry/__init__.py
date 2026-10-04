@@ -20,13 +20,11 @@ from .encoding import (
     normalize_orientation,
     orientation_choices,
 )
-
 from .voxel import (
     DEFAULT_MAX_ABS_POSITION_M,
     LogicalAxis,
     Voxel,
 )
-
 
 __all__ = [
     # -------------------------------------------------------------------------

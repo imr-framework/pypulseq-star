@@ -132,7 +132,7 @@ def define_protocol(
     overrides: dict[str, object] | None = None,
 ) -> ppstar.Protocol:
     fov = 256e-3
-    n_y = 256
+    n_y = 64
 
     protocol = ppstar.Protocol(
         name="gre",
