@@ -61,10 +61,11 @@ dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0",
   "ruff>=0.6",
+  "sigpy>=0.1.25",
   "twine>=5.1",
 ]
 all = [
-  "pypulseq-star[plotting,dashboard,dev]",
+  "pypulseq-star[plotting,rf,dashboard,dev]",
 ]
 
 [tool.hatch.version]
