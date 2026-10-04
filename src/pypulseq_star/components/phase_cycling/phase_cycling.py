@@ -62,11 +62,10 @@ Explicit phase tables can be represented directly::
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from itertools import product
-import math
 from typing import Callable, Iterable, Sequence
-
 
 # =============================================================================
 # PHASE HELPERS

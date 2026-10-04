@@ -37,7 +37,6 @@ from .phase_cycling import (
     wrap_phase,
 )
 
-
 __all__ = [
     "CYCLOPS_4",
     "EXORCYCLE_PHASES_4",

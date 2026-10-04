@@ -63,7 +63,6 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-
 _ALLOWED_MODES = {
     "linear",
     "accumulated",

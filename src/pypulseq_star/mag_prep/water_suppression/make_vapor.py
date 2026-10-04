@@ -1,10 +1,13 @@
 from __future__ import annotations
-import pypulseq_star as ppstar
-from dataclasses import dataclass, field, replace
-from typing import Any, Literal, TypeAlias
-import numpy as np
+
 import logging
 import math
+from dataclasses import dataclass, field, replace
+from typing import Any, Literal, TypeAlias
+
+import numpy as np
+
+import pypulseq_star as ppstar
 
 logging.basicConfig(level=logging.INFO)
 

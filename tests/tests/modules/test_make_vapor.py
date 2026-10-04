@@ -13,12 +13,11 @@ not depend on the optional SigPy RF-design backend.
 from __future__ import annotations
 
 import math
+from importlib import import_module
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-
-from importlib import import_module
 
 import pypulseq_star as ppstar
 

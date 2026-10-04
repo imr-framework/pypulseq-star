@@ -44,17 +44,21 @@ import argparse
 import math
 from dataclasses import dataclass
 from pathlib import Path
-import pypulseq_star as ppstar
-from pypulseq_star.mag_prep.water_suppression import make_vapor
-from pypulseq_star.geometry import Voxel
-from pypulseq_star.components.phase_cycling import PhaseCycle, make_phase_cycle, wrap_phase, EXORCYCLE_PHASES_4
-from pypulseq_star.sequence import vary
 
+import pypulseq_star as ppstar
+from pypulseq_star.components.phase_cycling import (
+    EXORCYCLE_PHASES_4,
+    PhaseCycle,
+    make_phase_cycle,
+    wrap_phase,
+)
+from pypulseq_star.geometry import Voxel
+from pypulseq_star.mag_prep.water_suppression import make_vapor
+from pypulseq_star.sequence import vary
 from pypulseq_star.writers import (
     GammaStarWriter,
     PulseqWriter,
 )
-
 
 # =============================================================================
 # 1. PRESS-SPECIFIC PHASE CYCLE

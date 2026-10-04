@@ -13,15 +13,19 @@ def test_gre_phase_encode_grid_tracks_matrix_and_fov(repo_root) -> None:
     protocol = demo.define_protocol()
     start = evaluate(protocol.parameters["phase_encode_start"], protocol)
     step = evaluate(protocol.parameters["phase_encode_step"], protocol)
-    assert start == pytest.approx(-0.5 * 64 / 0.256)
-    assert step == pytest.approx(1.0 / 0.256)
+    n_y = evaluate(protocol.parameters["n_y"], protocol)
+    fov = evaluate(protocol.parameters["fov"], protocol)
+    assert start == pytest.approx(-0.5 * n_y / fov)
+    assert step == pytest.approx(1.0 / fov)
 
     protocol.parameters["n_y"] = 128
     protocol.parameters["fov"] = 0.128
     start = evaluate(protocol.parameters["phase_encode_start"], protocol)
     step = evaluate(protocol.parameters["phase_encode_step"], protocol)
-    assert start == pytest.approx(-0.5 * 128 / 0.128)
-    assert step == pytest.approx(1.0 / 0.128)
+    n_y = evaluate(protocol.parameters["n_y"], protocol)
+    fov = evaluate(protocol.parameters["fov"], protocol)
+    assert start == pytest.approx(-0.5 * n_y / fov)
+    assert step == pytest.approx(1.0 / fov)
 
 
 @pytest.mark.parametrize("orientation", ["axial", "coronal", "sagittal"])

@@ -7,7 +7,6 @@ import importlib.util
 import re
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
