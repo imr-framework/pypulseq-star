@@ -57,3 +57,70 @@ def test_normalized_rf_uses_one_sequence_wide_scale() -> None:
 
     assert max(rendered["rf"][0]["v"]) == pytest.approx(0.5)
     assert max(rendered["rf"][1]["v"]) == pytest.approx(1.0)
+
+def test_publication_mode_applies_manuscript_style(system, monkeypatch) -> None:
+    """Publication mode should apply the stable manuscript-facing plot contract."""
+
+    seq = build_gradient_sequence(system)
+    monkeypatch.setattr(plt, "show", lambda: None)
+
+    figure = seq.plot(
+        title="Publication gradient test",
+        gradient_scale="mt_per_m",
+        publication=True,
+        show=False,
+        debug=False,
+    )
+
+    assert len(figure.axes) == 5
+
+    # Publication mode keeps the gradient channel name compact and moves the
+    # shared unit out of the vertically stacked y-axis labels.
+    ylabels = [axis.get_ylabel() for axis in figure.axes]
+    assert "GX" in ylabels
+    assert "GX (mT/m)" not in ylabels
+
+    unit_annotations = [
+        annotation
+        for axis in figure.axes
+        for annotation in axis.texts
+        if annotation.get_text() == "mT/m"
+    ]
+    assert len(unit_annotations) == 1
+
+    # Axis-number typography is part of the publication-mode contract.
+    visible_tick_labels = [
+        label
+        for axis in figure.axes
+        for label in (*axis.get_xticklabels(), *axis.get_yticklabels())
+        if label.get_visible()
+    ]
+    assert visible_tick_labels
+    assert all(label.get_fontsize() == pytest.approx(15) for label in visible_tick_labels)
+
+
+def test_publication_false_preserves_legacy_gradient_label(system, monkeypatch) -> None:
+    """Disabling publication mode must preserve existing plot-label behavior."""
+
+    seq = build_gradient_sequence(system)
+    monkeypatch.setattr(plt, "show", lambda: None)
+
+    figure = seq.plot(
+        title="Legacy gradient test",
+        gradient_scale="mt_per_m",
+        publication=False,
+        show=False,
+        debug=False,
+    )
+
+    ylabels = [axis.get_ylabel() for axis in figure.axes]
+    assert "GX (mT/m)" in ylabels
+
+    unit_annotations = [
+        annotation
+        for axis in figure.axes
+        for annotation in axis.texts
+        if annotation.get_text() == "mT/m"
+    ]
+    assert unit_annotations == []
+

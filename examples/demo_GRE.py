@@ -141,7 +141,13 @@ def define_protocol(
             "sequence_name": "gre",
             "sequence_type": "GRE",
             "orientation": orientation,
+            # Retain the historical common in-plane FOV while exposing
+            # independent read/phase FOV controls.  This lets protocol-edit
+            # demonstrations change phase encoding without making the readout
+            # physically infeasible under the scanner-tested system limits.
             "fov": fov,
+            "fov_read": fov,
+            "fov_phase": fov,
             "n_x": 256,
             "n_y": n_y,
             "slice_thickness": 3e-3,
@@ -149,7 +155,7 @@ def define_protocol(
             "rf_duration": 3e-3,
             "readout_duration": 3.2e-3,
             "echo_time": 6e-3,
-            "repetition_time": 12e-3,
+            "repetition_time": 15e-3,
             "apodization": 0.42,
             "time_bw_product": 4.0,
             "rf_spoiling_increment": 117.0,
@@ -159,7 +165,7 @@ def define_protocol(
             "readout_ramp_time": 100e-6,
             "prephaser_duration": 2e-3,
             "prephaser_ramp_time": 300e-6,
-            "spoiler_duration": 2.5e-3,
+            "spoiler_duration": 4e-3,
             "spoiler_ramp_time": 300e-6,
 
             "rf_phase_offset": 0.0,
@@ -179,7 +185,16 @@ def define_protocol(
     )
 
     if overrides:
-        protocol.parameters.update(overrides)
+        normalized_overrides = dict(overrides)
+
+        # Backward compatibility: the historical ``fov`` override still means
+        # a common in-plane FOV unless an axis-specific value is supplied.
+        if "fov" in normalized_overrides:
+            common_fov = normalized_overrides["fov"]
+            normalized_overrides.setdefault("fov_read", common_fov)
+            normalized_overrides.setdefault("fov_phase", common_fov)
+
+        protocol.parameters.update(normalized_overrides)
 
     # Keep phase-encode limits as named protocol-level derived relationships.
     # The variation below then references p.phase_encode_start and
@@ -188,13 +203,14 @@ def define_protocol(
     # must update with it rather than retaining the original 64-line default.
     #
     # Convention used here:
-    #     ky(i) = -0.5 * n_y / fov + i / fov,  i = 0 ... n_y - 1
+    #     ky(i) = -0.5 * n_y / fov_phase + i / fov_phase,
+    #             i = 0 ... n_y - 1
     #
     # This matches the usual even-matrix DFT-style phase-encode grid
     # [-Ny/2, ..., Ny/2 - 1] * Δk.
     p = protocol.symbols
-    protocol.parameters["phase_encode_start"] = -0.5 * p.n_y / p.fov
-    protocol.parameters["phase_encode_step"] = 1.0 / p.fov
+    protocol.parameters["phase_encode_start"] = -0.5 * p.n_y / p.fov_phase
+    protocol.parameters["phase_encode_step"] = 1.0 / p.fov_phase
 
     return protocol
 
@@ -228,7 +244,7 @@ def build_sequence(
 
     seq.set_definition(
         "FOV",
-        [p.fov, p.fov, p.slice_thickness],
+        [p.fov_read, p.fov_phase, p.slice_thickness],
     )
     seq.set_definition("Name", p.sequence_name)
 
@@ -243,7 +259,8 @@ def build_sequence(
         repeat_mode="loop",
     )
 
-    delta_k = p.phase_encode_step
+    delta_k_read = 1.0 / p.fov_read
+    delta_k_phase = p.phase_encode_step
 
     # ==================
     # CREATE BASE EVENTS
@@ -295,7 +312,7 @@ def build_sequence(
     gx = ppstar.make_trapezoid(
         channel="x",
         axis_role="read",
-        flat_area=p.n_x * delta_k,
+        flat_area=p.n_x * delta_k_read,
         flat_time=p.readout_duration,
         rise_time=readout_ramp_time,
         fall_time=readout_ramp_time,
@@ -440,7 +457,7 @@ def build_sequence(
     gx_spoil = ppstar.make_trapezoid(
         channel="x",
         axis_role="read",
-        area=2.0 * p.n_x * delta_k,
+        area=2.0 * p.n_x * delta_k_read,
         rise_time=spoiler_ramp_time,
         flat_time=spoiler_flat_time,
         fall_time=spoiler_ramp_time,
@@ -451,7 +468,7 @@ def build_sequence(
     gy_spoil = ppstar.make_trapezoid(
         channel="y",
         axis_role="phase",
-        area=2.0 * p.n_y * delta_k,
+        area=2.0 * p.n_y * delta_k_phase,
         rise_time=spoiler_ramp_time,
         flat_time=spoiler_flat_time,
         fall_time=spoiler_ramp_time,
@@ -674,7 +691,21 @@ if __name__ == "__main__":
         description="Protocol-centered relationship-aware spoiled GRE demo."
     )
     parser.add_argument("--n-y", type=int, help="Override phase-encode matrix size.")
-    parser.add_argument("--fov", type=float, help="Override in-plane FOV in metres.")
+    parser.add_argument(
+        "--fov",
+        type=float,
+        help="Override both read and phase FOV in metres (backward-compatible shortcut).",
+    )
+    parser.add_argument(
+        "--fov-read",
+        type=float,
+        help="Override read-direction FOV in metres.",
+    )
+    parser.add_argument(
+        "--fov-phase",
+        type=float,
+        help="Override phase-direction FOV in metres.",
+    )
     parser.add_argument(
         "--rf-spoiling-increment",
         type=float,
@@ -703,6 +734,10 @@ if __name__ == "__main__":
         overrides["n_y"] = args.n_y
     if args.fov is not None:
         overrides["fov"] = args.fov
+    if args.fov_read is not None:
+        overrides["fov_read"] = args.fov_read
+    if args.fov_phase is not None:
+        overrides["fov_phase"] = args.fov_phase
     if args.rf_spoiling_increment is not None:
         overrides["rf_spoiling_increment"] = args.rf_spoiling_increment
     if args.te is not None:

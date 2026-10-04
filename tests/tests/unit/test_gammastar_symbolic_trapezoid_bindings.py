@@ -39,7 +39,7 @@ def _build_document() -> dict:
     system = demo_GRE.define_system_limits()
     protocol = demo_GRE.define_protocol(
         orientation="axial",
-        overrides={"n_y": 128, "fov": 0.256},
+        overrides={"n_y": 128, "fov_read": 0.256, "fov_phase": 0.256},
     )
     sequence, _, _ = demo_GRE.build_sequence(
         system,
@@ -67,6 +67,11 @@ def test_protocol_driven_fixed_shape_trapezoids_keep_live_area() -> None:
 
     parameters = _build_document()["parameters"]
 
+    expected_sources = {
+        "gx_spoil": {"root.prot.n_x", "root.prot.fov_read"},
+        "gy_spoil": {"root.prot.n_y", "root.prot.fov_phase"},
+    }
+
     for event_name in ("gx_spoil", "gy_spoil"):
         area_path, area_parameter = _find_named_gradient_parameter(
             parameters,
@@ -76,7 +81,7 @@ def test_protocol_driven_fixed_shape_trapezoids_keep_live_area() -> None:
         assert area_parameter["inputs"], area_path
 
         input_sources = set(area_parameter["inputs"].values())
-        assert "root.prot.fov" in input_sources
+        assert expected_sources[event_name].issubset(input_sources)
         assert "root.prot.phase_encode_step" not in input_sources
 
         leaf = area_path.removesuffix(".area")

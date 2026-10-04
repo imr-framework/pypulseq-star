@@ -13,6 +13,7 @@ channels from the enriched SeqStar object model.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import fields, is_dataclass
 from pathlib import Path
@@ -51,8 +52,14 @@ class SeqStarPlotter:
         dpi: int = 140,
         debug: bool = False,
         show_blocks: bool = True,
+        publication: bool = False,
     ):
-        """Create a gammaSTAR-like sequence plot."""
+        """Create a gammaSTAR-like sequence plot.
+
+        ``publication=True`` applies manuscript-oriented typography and line
+        weights after the standard figure has been created.  The default
+        ``False`` leaves the existing plotting path unchanged.
+        """
 
         render = self.render_sequence(
             time_range=time_range,
@@ -81,6 +88,9 @@ class SeqStarPlotter:
             figsize=figsize,
             show_blocks=show_blocks,
         )
+
+        if publication:
+            _apply_publication_style(fig)
 
         if save is not None:
             output_path = Path(save)
@@ -993,6 +1003,7 @@ def plot(
     dpi: int = 140,
     debug: bool = False,
     show_blocks: bool = True,
+    publication: bool = False,
 ):
     """Convenience function matching PyPulseq-style plotting."""
 
@@ -1008,9 +1019,101 @@ def plot(
         dpi=dpi,
         debug=debug,
         show_blocks=show_blocks,
+        publication=publication,
     )
 
 
+
+def _apply_publication_style(fig: Any) -> None:
+    """Apply manuscript-oriented styling to an already rendered figure.
+
+    This function is intentionally presentation-only.  It does not alter
+    sequence realization, event timing, amplitudes, channel scaling, or the
+    selected time range.  When ``publication=False`` this function is never
+    called, so the legacy plotting path is unchanged.
+
+    Publication-specific label policy
+    ---------------------------------
+    Gradient channel labels are shortened from, for example, ``GX (mT/m)``
+    to ``GX``, ``GY``, and ``GZ``.  The common gradient unit is shown once,
+    immediately above the first gradient axis, so vertically rotated labels
+    cannot collide in tightly stacked manuscript panels.
+    """
+
+    title = getattr(fig, "_suptitle", None)
+    if title is not None:
+        title.set_fontsize(20)
+        title.set_fontweight("bold")
+
+    gradient_axes: list[Any] = []
+    gradient_unit: str | None = None
+
+    for ax in fig.axes:
+        ax.xaxis.label.set_fontsize(15)
+        ax.xaxis.label.set_fontweight("semibold")
+        ax.yaxis.label.set_fontsize(15)
+        ax.yaxis.label.set_fontweight("semibold")
+
+        # Increase axis-number readability by two points relative to the
+        # first publication-mode pass (13 -> 15 pt).
+        ax.tick_params(
+            axis="both",
+            which="major",
+            labelsize=15,
+            width=1.1,
+            length=4.5,
+        )
+
+        # Keep gradient channel names compact.  The unit is shared across
+        # GX/GY/GZ and is therefore displayed only once below.
+        ylabel = ax.get_ylabel().strip()
+        gradient_match = re.fullmatch(
+            r"(G[XYZ])(?:\s*\(([^)]+)\))?",
+            ylabel,
+            flags=re.IGNORECASE,
+        )
+        if gradient_match is not None:
+            channel_label = gradient_match.group(1).upper()
+            unit = gradient_match.group(2)
+
+            ax.set_ylabel(channel_label)
+            gradient_axes.append(ax)
+
+            if gradient_unit is None and unit:
+                gradient_unit = unit
+
+        for spine in ("left", "bottom"):
+            ax.spines[spine].set_linewidth(1.05)
+
+        # Increase visibility of existing plotted waveforms/guides without
+        # changing their data.  Very thin guide/grid lines are left alone.
+        for line in ax.lines:
+            width = float(line.get_linewidth())
+            if width >= 1.2:
+                line.set_linewidth(max(width, 2.3))
+
+        ax.xaxis.labelpad = max(float(ax.xaxis.labelpad), 7.0)
+        ax.yaxis.labelpad = max(float(ax.yaxis.labelpad), 7.0)
+
+    fig.tight_layout(rect=(0, 0, 1, 0.945))
+
+    # Show the common gradient unit once, horizontally, just above the first
+    # gradient axis.  Keeping the annotation horizontal avoids the vertical
+    # GX/GY/GZ label collisions seen after the first publication-style pass.
+    if gradient_axes and gradient_unit:
+        gradient_axes[0].annotate(
+            gradient_unit,
+            xy=(0.0, 1.0),
+            xycoords="axes fraction",
+            xytext=(-2, 3),
+            textcoords="offset points",
+            ha="right",
+            va="bottom",
+            fontsize=13,
+            fontweight="semibold",
+            color="#444444",
+            annotation_clip=False,
+        )
 
 
 def _expand_rendered_node_repetitions(

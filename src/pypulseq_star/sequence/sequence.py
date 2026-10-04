@@ -1634,6 +1634,7 @@ class SeqStarSequence(SeqStarNode):
         gradient_scale: str = "auto",
         figsize: tuple[float, float] = (15.0, 8.5),
         dpi: int = 140,
+        publication: bool = False,
         **_: Any,
     ):
         """Plot the sequence using a gammaSTAR-like stacked timeline.
@@ -1648,6 +1649,7 @@ class SeqStarSequence(SeqStarNode):
             seq.plot(one_tr=True)
             seq.plot(save="sequence.png")
             seq.plot(rf_scale="tesla", gradient_scale="mt_per_m")
+            seq.plot(publication=True)
         """
 
         
@@ -1663,4 +1665,5 @@ class SeqStarSequence(SeqStarNode):
             gradient_scale=gradient_scale,
             figsize=figsize,
             dpi=dpi,
+            publication=publication,
         )
