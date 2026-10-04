@@ -443,21 +443,24 @@ class SeqStarRFGaussShape(SeqStarRFShape):
 
 @dataclass(slots=True)
 class SeqStarRFArbitraryShape(SeqStarRFShape):
-    """Rastered arbitrary RF waveform.
+    """Rastered arbitrary complex RF waveform.
 
-    This is the RF-shape counterpart to ``make_arbitrary_rf``. It handles
-    real-valued RF envelope samples only. Complex RF samples and per-sample
-    phase/frequency modulation will be added later.
+    The input signal is a dimensionless complex RF envelope. Its magnitude
+    represents RF amplitude modulation and its phase represents RF phase
+    modulation.
 
-    The input signal is treated as a dimensionless envelope and scaled so that:
+    The waveform is scaled so that:
 
-        flip_angle = 2*pi*gamma*integral(B1(t) dt)
+        flip_angle = 2*pi*gamma*|integral(B1(t) dt)|
 
     where gamma is in Hz/T.
+
+    Complex samples are retained natively so arbitrary SLR and other
+    phase-modulated RF waveforms can be represented without discarding phase.
     """
 
     kind: str = "rf_arbitrary"
-    signal: list[float] = field(default_factory=list)
+    signal: list[complex] = field(default_factory=list)
 
     def to_gammastar_samples(
         self,
@@ -466,23 +469,7 @@ class SeqStarRFArbitraryShape(SeqStarRFShape):
         gamma_hz_per_t: float,
         max_rf: float | None = None,
     ) -> dict[str, object]:
-        """Return gammaSTAR RF samples for an arbitrary RF pulse.
-
-        Returns
-        -------
-        dict
-            gammaSTAR-compatible RF sample dictionary:
-
-                {
-                    "t": [...],
-                    "v": [{"am": [...], "fm": [...]}]
-                }
-
-        Notes
-        -----
-        The amplitude samples are B1 in tesla. Frequency modulation is set to
-        zero for now.
-        """
+        """Return gammaSTAR RF samples for an arbitrary complex RF pulse."""
 
         self._validate_common_rf_inputs(
             flip_angle=flip_angle,
@@ -493,27 +480,130 @@ class SeqStarRFArbitraryShape(SeqStarRFShape):
 
         if self.rf_raster_time is None:
             raise ValueError(
-                "SeqStarRFArbitraryShape requires rf_raster_time for sample generation."
+                "SeqStarRFArbitraryShape requires rf_raster_time "
+                "for sample generation."
             )
 
         t_values, envelope = self.normalized_envelope()
 
-        area = sum(envelope) * self.rf_raster_time
+        complex_area = (
+            sum(envelope)
+            * self.rf_raster_time
+        )
 
-        if abs(area) <= 0:
+        area_magnitude = abs(
+            complex_area
+        )
+
+        if area_magnitude <= 0:
             raise ValueError(
-                "Arbitrary RF signal has zero signed area and cannot be scaled "
-                "to the requested flip angle. Use a signal with nonzero integral."
+                "Arbitrary RF signal has zero complex integral and cannot "
+                "be scaled to the requested flip angle."
             )
 
-        scale_t = flip_angle / (2.0 * math.pi * gamma_hz_per_t * area)
-        am_values = [scale_t * value for value in envelope]
-        fm_values = [0.0 for _ in am_values]
+        scale_t = (
+            flip_angle
+            / (
+                2.0
+                * math.pi
+                * gamma_hz_per_t
+                * area_magnitude
+            )
+        )
 
-        effective_max_rf = max_rf if max_rf is not None else self.max_rf
+        complex_b1 = [
+            scale_t * value
+            for value in envelope
+        ]
+
+        am_values = [
+            abs(value)
+            for value in complex_b1
+        ]
+
+        phases = [
+            math.atan2(
+                value.imag,
+                value.real,
+            )
+            for value in complex_b1
+        ]
+
+        # Unwrap phase so finite differences do not contain artificial
+        # +/-2*pi discontinuities.
+        unwrapped_phase: list[float] = []
+
+        if phases:
+            unwrapped_phase.append(
+                phases[0]
+            )
+
+            for phase in phases[1:]:
+                previous = unwrapped_phase[-1]
+
+                delta = phase - previous
+
+                while delta > math.pi:
+                    phase -= 2.0 * math.pi
+                    delta = phase - previous
+
+                while delta < -math.pi:
+                    phase += 2.0 * math.pi
+                    delta = phase - previous
+
+                unwrapped_phase.append(
+                    phase
+                )
+
+        # gammaSTAR represents RF phase evolution through frequency
+        # modulation:
+        #
+        #     d(phi)/dt = 2*pi*f
+        #
+        # Therefore:
+        #
+        #     f = d(phi)/(2*pi*dt)
+        #
+        # Use a forward difference, with the last sample retaining the
+        # previous modulation value.
+        fm_values: list[float] = []
+
+        if len(unwrapped_phase) == 1:
+            fm_values = [0.0]
+
+        elif unwrapped_phase:
+            for index in range(
+                len(unwrapped_phase) - 1
+            ):
+                delta_phase = (
+                    unwrapped_phase[index + 1]
+                    - unwrapped_phase[index]
+                )
+
+                fm_values.append(
+                    delta_phase
+                    / (
+                        2.0
+                        * math.pi
+                        * self.rf_raster_time
+                    )
+                )
+
+            fm_values.append(
+                fm_values[-1]
+            )
+
+        effective_max_rf = (
+            max_rf
+            if max_rf is not None
+            else self.max_rf
+        )
 
         if am_values:
-            peak_amplitude_t = max(abs(value) for value in am_values)
+            peak_amplitude_t = max(
+                am_values
+            )
+
             self._check_max_rf(
                 amplitude_t=peak_amplitude_t,
                 max_rf=effective_max_rf,
@@ -529,8 +619,10 @@ class SeqStarRFArbitraryShape(SeqStarRFShape):
             ],
         }
 
-    def normalized_envelope(self) -> tuple[list[float], list[float]]:
-        """Return rastered arbitrary-envelope samples.
+    def normalized_envelope(
+        self,
+    ) -> tuple[list[float], list[complex]]:
+        """Return rastered arbitrary complex-envelope samples.
 
         ``make_arbitrary_rf`` already resamples the incoming waveform to the
         RF raster before constructing this shape. This method validates that
@@ -540,69 +632,102 @@ class SeqStarRFArbitraryShape(SeqStarRFShape):
 
         if self.rf_raster_time is None:
             raise ValueError(
-                "rf_raster_time is required for arbitrary RF envelope generation."
+                "rf_raster_time is required for arbitrary RF "
+                "envelope generation."
             )
 
         self._validate_arbitrary_inputs()
 
-        n_expected = int(round(self.duration / self.rf_raster_time))
+        n_expected = int(
+            round(
+                self.duration
+                / self.rf_raster_time
+            )
+        )
 
         if n_expected < 1:
             raise ValueError(
-                "Arbitrary RF duration must contain at least one RF raster sample. "
-                f"duration={self.duration}, rf_raster_time={self.rf_raster_time}"
+                "Arbitrary RF duration must contain at least one RF "
+                "raster sample. "
+                f"duration={self.duration}, "
+                f"rf_raster_time={self.rf_raster_time}"
             )
 
         if len(self.signal) != n_expected:
             raise ValueError(
-                "Arbitrary RF signal length is not consistent with duration and "
-                "rf_raster_time. "
-                f"len(signal)={len(self.signal)}, expected={n_expected}, "
-                f"duration={self.duration}, rf_raster_time={self.rf_raster_time}"
+                "Arbitrary RF signal length is not consistent with "
+                "duration and rf_raster_time. "
+                f"len(signal)={len(self.signal)}, "
+                f"expected={n_expected}, "
+                f"duration={self.duration}, "
+                f"rf_raster_time={self.rf_raster_time}"
             )
 
         t_values = [
-            (index + 0.5) * self.rf_raster_time
+            (index + 0.5)
+            * self.rf_raster_time
             for index in range(n_expected)
         ]
 
-        return t_values, list(self.signal)
+        return (
+            t_values,
+            [
+                complex(value)
+                for value in self.signal
+            ],
+        )
 
-    def _validate_arbitrary_inputs(self) -> None:
+    def _validate_arbitrary_inputs(
+        self,
+    ) -> None:
         """Validate arbitrary-shape-specific inputs."""
 
         if self.rf_raster_time is None:
-            raise ValueError("rf_raster_time is required for arbitrary RF shapes.")
+            raise ValueError(
+                "rf_raster_time is required for arbitrary RF shapes."
+            )
 
         if self.rf_raster_time <= 0:
             raise ValueError(
-                f"rf_raster_time must be positive. Passed: {self.rf_raster_time}"
+                "rf_raster_time must be positive. "
+                f"Passed: {self.rf_raster_time}"
             )
 
         if not self.signal:
-            raise ValueError("Arbitrary RF signal must contain at least one sample.")
+            raise ValueError(
+                "Arbitrary RF signal must contain at least one sample."
+            )
 
-        for index, value in enumerate(self.signal):
-            if isinstance(value, complex):
-                raise NotImplementedError(
-                    "Complex arbitrary RF samples are not supported yet in "
-                    "SeqStarRFArbitraryShape. Use real-valued samples for now."
+        for index, value in enumerate(
+            self.signal
+        ):
+            try:
+                sample = complex(
+                    value
                 )
-
-            if not isinstance(value, (float, int)):
+            except (TypeError, ValueError) as exc:
                 raise TypeError(
-                    f"signal[{index}] must be numeric. Passed: {value!r}"
-                )
+                    f"signal[{index}] must be numeric. "
+                    f"Passed: {value!r}"
+                ) from exc
 
-            if not math.isfinite(float(value)):
+            if not (
+                math.isfinite(sample.real)
+                and math.isfinite(sample.imag)
+            ):
                 raise ValueError(
-                    f"signal[{index}] must be finite. Passed: {value!r}"
+                    f"signal[{index}] must be finite. "
+                    f"Passed: {value!r}"
                 )
 
-        if max(abs(float(value)) for value in self.signal) <= 0:
-            raise ValueError("Arbitrary RF signal must not be all zeros.")
-
-
+        if max(
+            abs(complex(value))
+            for value in self.signal
+        ) <= 0:
+            raise ValueError(
+                "Arbitrary RF signal must not be all zeros."
+            )
+        
 def _sinc(x: float) -> float:
     """Return normalized sinc(x) = sin(pi*x)/(pi*x)."""
 

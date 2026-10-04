@@ -15,34 +15,21 @@ import demo_GRE  # noqa: E402
 from pypulseq_star.writers import GammaStarWriter  # noqa: E402
 
 
-def _find_parameter(parameters: dict, suffix: str) -> tuple[str, dict]:
-    matches = [
-        (path, value)
-        for path, value in parameters.items()
-        if path.endswith(suffix)
-    ]
-    assert len(matches) == 1, (
-        f"Expected one parameter ending in {suffix!r}; "
-        f"found {[path for path, _ in matches]}"
-    )
-    return matches[0]
-
-
-def _find_event_parameter(
+def _find_named_gradient_parameter(
     parameters: dict,
-    *,
     event_name: str,
-    field_suffix: str,
+    field: str,
 ) -> tuple[str, dict]:
-    """Find an event parameter without depending on generated block/event IDs."""
-    token = f".{event_name}_"
+    """Find one gradient field without depending on block/event indices."""
+
+    suffix = f".grad.{field}"
     matches = [
         (path, value)
         for path, value in parameters.items()
-        if token in path and path.endswith(field_suffix)
+        if event_name in path and path.endswith(suffix)
     ]
     assert len(matches) == 1, (
-        f"Expected one {event_name!r} parameter ending in {field_suffix!r}; "
+        f"Expected one {event_name!r} gradient parameter ending in {suffix!r}; "
         f"found {[path for path, _ in matches]}"
     )
     return matches[0]
@@ -52,7 +39,7 @@ def _build_document() -> dict:
     system = demo_GRE.define_system_limits()
     protocol = demo_GRE.define_protocol(
         orientation="axial",
-        overrides={"n_y": 128, "fov": 0.256},
+        overrides={"n_y": 128, "fov_read": 0.256, "fov_phase": 0.256},
     )
     sequence, _, _ = demo_GRE.build_sequence(
         system,
@@ -64,65 +51,81 @@ def _build_document() -> dict:
 
 
 def test_export_does_not_fail_on_event_property_reference() -> None:
-    """gx_pre uses -0.5 * gx.area and must remain exportable."""
-    document = _build_document()
-    parameters = document["parameters"]
+    """Non-protocol event references remain safely resolved as literals."""
 
-    _, gx_pre_area = _find_event_parameter(
+    parameters = _build_document()["parameters"]
+    _, gx_pre_area = _find_named_gradient_parameter(
         parameters,
-        event_name="gx_prephaser",
-        field_suffix=".grad.area",
+        "gx_prephaser",
+        "area",
     )
-    # The unsupported EventPropertyRef form should remain a resolved literal,
-    # not abort the export.
     assert gx_pre_area["inputs"] == {}
 
 
-def test_gre_spoilers_retain_fov_relationships() -> None:
+def test_protocol_driven_fixed_shape_trapezoids_keep_live_area() -> None:
+    """Area stays live while explicitly authored gradient timing stays fixed."""
+
     parameters = _build_document()["parameters"]
 
-    for event_suffix in (
-        ".gx_spoil_b004_e007.grad.area",
-        ".gy_spoil_b004_e008.grad.area",
-    ):
-        area_path, area_parameter = _find_parameter(
+    expected_sources = {
+        "gx_spoil": {"root.prot.n_x", "root.prot.fov_read"},
+        "gy_spoil": {"root.prot.n_y", "root.prot.fov_phase"},
+    }
+
+    for event_name in ("gx_spoil", "gy_spoil"):
+        area_path, area_parameter = _find_named_gradient_parameter(
             parameters,
-            event_suffix,
+            event_name,
+            "area",
         )
         assert area_parameter["inputs"], area_path
+
         input_sources = set(area_parameter["inputs"].values())
-        # The backend-consumed spoiler area must depend directly on the
-        # editable FOV control. gammaSTAR does not reliably invalidate the
-        # transitive chain fov -> phase_encode_step -> area -> samples.
-        assert "root.prot.fov" in input_sources
+        assert expected_sources[event_name].issubset(input_sources)
         assert "root.prot.phase_encode_step" not in input_sources
 
         leaf = area_path.removesuffix(".area")
         samples_parameter = parameters[f"{leaf}.samples"]
         assert samples_parameter["inputs"]["area"] == area_path
-        assert samples_parameter["inputs"]["grad_set"] == (
-            "root.gradient_settings"
-        )
-        assert samples_parameter["inputs"]["gamma"] == "root.sys.gamma"
 
+        normalized_path = samples_parameter["inputs"]["shape"]
+        assert normalized_path == f"{leaf}.seqstar_normalized_samples"
+        assert parameters[normalized_path]["inputs"] == {}
+
+        # Explicit rise/flat/fall timing is the authored contract.  Varying a
+        # protocol-driven area must scale the waveform, not make duration live.
         duration_parameter = parameters[f"{leaf}.duration"]
-        assert duration_parameter["inputs"]["samples"] == (
-            f"{leaf}.samples"
-        )
+        assert duration_parameter["inputs"] == {}
+
+        max_amp_parameter = parameters[f"{leaf}.max_abs_amplitude"]
+        assert max_amp_parameter["inputs"]["samples"] == f"{leaf}.samples"
 
 
-def test_gre_spoiler_block_duration_remains_live() -> None:
+def test_fixed_shape_spoiler_timing_is_not_reintroduced_as_dynamic() -> None:
+    """Fixed-shape gradients must not acquire an area-dependent block duration."""
+
     parameters = _build_document()["parameters"]
 
-    block_duration = parameters[
-        "root.kernel.kernel.seqstar_blocks.kernel_spoiling.duration"
-    ]
-    input_paths = set(block_duration["inputs"].values())
-    assert any(
-        path.endswith(".gx_spoil_b004_e007.duration")
-        for path in input_paths
-    )
-    assert any(
-        path.endswith(".gy_spoil_b004_e008.duration")
-        for path in input_paths
-    )
+    for event_name in ("gx_spoil", "gy_spoil"):
+        area_path, _ = _find_named_gradient_parameter(
+            parameters,
+            event_name,
+            "area",
+        )
+        leaf = area_path.removesuffix(".area")
+        assert parameters[f"{leaf}.duration"]["inputs"] == {}
+
+    dynamic_block_durations = []
+    for path, parameter in parameters.items():
+        if not path.endswith(".duration") or not isinstance(parameter, dict):
+            continue
+        inputs = parameter.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+        sources = {str(value) for value in inputs.values()}
+        if any("gx_spoil" in source for source in sources) or any(
+            "gy_spoil" in source for source in sources
+        ):
+            dynamic_block_durations.append(path)
+
+    assert dynamic_block_durations == []

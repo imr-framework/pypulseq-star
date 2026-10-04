@@ -181,7 +181,7 @@ def define_system_limits() -> ppstar.Opts:
         rf_raster_time=2e-6,
         grad_raster_time=10e-6,
         block_duration_raster=10e-6,
-        adc_raster_time=100e-9,
+        adc_raster_time=1e-6,
         gamma=42.575575e6,
     )
 

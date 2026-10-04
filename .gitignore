@@ -8,6 +8,7 @@ __pycache__/
 .pyre/
 .pytype/
 .hypothesis/
+__MACOSX/
 
 # Virtual environments
 .venv/
@@ -71,6 +72,7 @@ outputs/
 *.png
 *.svg
 *.pdf
+/data/
 
 # Keep source-controlled package resources and documentation assets
 !src/pypulseq_star/**/*.json
@@ -79,6 +81,7 @@ outputs/
 !docs/**/*.svg
 !docs/**/*.pdf
 !examples/**/*.json
+!src/pypulseq_star/**/*.seq
 
 # Local logs, caches, and temporary files
 *.log

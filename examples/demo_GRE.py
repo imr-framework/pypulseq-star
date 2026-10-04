@@ -28,6 +28,33 @@ from pypulseq_star.writers import GammaStarWriter, PulseqWriter
 ORIENTATION = "axial"  # "axial", "coronal", or "sagittal"
 
 
+# =============================================================================
+# CONVENTIONAL RF SPOILING
+# =============================================================================
+#
+# For increment phi_inc, conventional spoiled GRE uses
+#
+#     phi[n] = 0.5 * n * (n + 1) * phi_inc   (mod 2*pi)
+#
+# so a 117 degree increment begins 0, 117, 351, 342, 90, ... degrees.
+# The same phase is applied to RF and ADC for each ky line.
+# =============================================================================
+
+
+def _rf_spoiling_phase_table(
+    num_repetitions: int,
+    increment_deg: float,
+) -> tuple[float, ...]:
+    """Return conventional quadratic RF-spoiling phases in radians."""
+
+    increment_rad = math.radians(float(increment_deg))
+    return tuple(
+        (0.5 * index * (index + 1) * increment_rad) % (2.0 * math.pi)
+        for index in range(int(num_repetitions))
+    )
+
+
+
 
 def _launch_relationship_dashboard(
     seq: ppstar.Sequence,
@@ -83,15 +110,19 @@ def _launch_relationship_dashboard(
 
 def define_system_limits() -> ppstar.Opts:
     return ppstar.Opts(
-        max_grad=28,
+        max_grad=28.0,
         grad_unit="mT/m",
-        max_slew=150,
+        max_slew=120.0,
         slew_unit="T/m/s",
         rf_ringdown_time=20e-6,
         rf_dead_time=100e-6,
-        adc_dead_time=10e-6,
+        adc_dead_time=120e-6, # adc - ds head 1 32 channel
         rf_raster_time=2e-6,
         grad_raster_time=10e-6,
+        block_duration_raster=10e-6,
+        adc_raster_time=1e-9,
+        gamma=42.575575e6,
+        max_rf = 15e-6,
     )
 
 
@@ -110,19 +141,33 @@ def define_protocol(
             "sequence_name": "gre",
             "sequence_type": "GRE",
             "orientation": orientation,
+            # Retain the historical common in-plane FOV while exposing
+            # independent read/phase FOV controls.  This lets protocol-edit
+            # demonstrations change phase encoding without making the readout
+            # physically infeasible under the scanner-tested system limits.
             "fov": fov,
-            "n_x": 64,
+            "fov_read": fov,
+            "fov_phase": fov,
+            "n_x": 256,
             "n_y": n_y,
             "slice_thickness": 3e-3,
             "flip_angle": 10.0,
             "rf_duration": 3e-3,
             "readout_duration": 3.2e-3,
-            "echo_time": 5e-3,
-            "repetition_time": 12e-3,
+            "echo_time": 6e-3,
+            "repetition_time": 15e-3,
             "apodization": 0.42,
             "time_bw_product": 4.0,
             "rf_spoiling_increment": 117.0,
-            "prephaser_duration": 1e-3,
+
+            # Realization controls used to leave margin below the unchanged
+            # scanner Gmax/Smax limits and to align ADC with the read plateau.
+            "readout_ramp_time": 100e-6,
+            "prephaser_duration": 2e-3,
+            "prephaser_ramp_time": 300e-6,
+            "spoiler_duration": 4e-3,
+            "spoiler_ramp_time": 300e-6,
+
             "rf_phase_offset": 0.0,
             "rf_frequency_offset": 0.0,
             "adc_phase_offset": 0.0,
@@ -140,7 +185,16 @@ def define_protocol(
     )
 
     if overrides:
-        protocol.parameters.update(overrides)
+        normalized_overrides = dict(overrides)
+
+        # Backward compatibility: the historical ``fov`` override still means
+        # a common in-plane FOV unless an axis-specific value is supplied.
+        if "fov" in normalized_overrides:
+            common_fov = normalized_overrides["fov"]
+            normalized_overrides.setdefault("fov_read", common_fov)
+            normalized_overrides.setdefault("fov_phase", common_fov)
+
+        protocol.parameters.update(normalized_overrides)
 
     # Keep phase-encode limits as named protocol-level derived relationships.
     # The variation below then references p.phase_encode_start and
@@ -149,13 +203,14 @@ def define_protocol(
     # must update with it rather than retaining the original 64-line default.
     #
     # Convention used here:
-    #     ky(i) = -0.5 * n_y / fov + i / fov,  i = 0 ... n_y - 1
+    #     ky(i) = -0.5 * n_y / fov_phase + i / fov_phase,
+    #             i = 0 ... n_y - 1
     #
     # This matches the usual even-matrix DFT-style phase-encode grid
     # [-Ny/2, ..., Ny/2 - 1] * Δk.
     p = protocol.symbols
-    protocol.parameters["phase_encode_start"] = -0.5 * p.n_y / p.fov
-    protocol.parameters["phase_encode_step"] = 1.0 / p.fov
+    protocol.parameters["phase_encode_start"] = -0.5 * p.n_y / p.fov_phase
+    protocol.parameters["phase_encode_step"] = 1.0 / p.fov_phase
 
     return protocol
 
@@ -189,7 +244,7 @@ def build_sequence(
 
     seq.set_definition(
         "FOV",
-        [p.fov, p.fov, p.slice_thickness],
+        [p.fov_read, p.fov_phase, p.slice_thickness],
     )
     seq.set_definition("Name", p.sequence_name)
 
@@ -204,7 +259,8 @@ def build_sequence(
         repeat_mode="loop",
     )
 
-    delta_k = p.phase_encode_step
+    delta_k_read = 1.0 / p.fov_read
+    delta_k_phase = p.phase_encode_step
 
     # ==================
     # CREATE BASE EVENTS
@@ -232,11 +288,35 @@ def build_sequence(
     gz.axis_role = "slice"
     gz_reph.axis_role = "slice"
 
+    # -------------------------------------------------------------------------
+    # Readout / ADC alignment
+    # -------------------------------------------------------------------------
+    # Keep adc_dead_time unchanged. Delay the read gradient so its flat top
+    # starts exactly when ADC begins:
+    #
+    #     gx.delay + gx.rise_time == adc.delay
+    #
+    # This mirrors the timing pattern in the scanner-proven MATLAB Pulseq GRE.
+    # -------------------------------------------------------------------------
+
+    readout_ramp_time = float(protocol.parameters["readout_ramp_time"])
+    readout_gradient_delay = float(system.adc_dead_time) - readout_ramp_time
+
+    if readout_gradient_delay < 0:
+        raise ValueError(
+            "readout_ramp_time must not exceed adc_dead_time. "
+            f"readout_ramp_time={readout_ramp_time:.9g} s, "
+            f"adc_dead_time={float(system.adc_dead_time):.9g} s."
+        )
+
     gx = ppstar.make_trapezoid(
         channel="x",
         axis_role="read",
-        flat_area=p.n_x * delta_k,
+        flat_area=p.n_x * delta_k_read,
         flat_time=p.readout_duration,
+        rise_time=readout_ramp_time,
+        fall_time=readout_ramp_time,
+        delay=readout_gradient_delay,
         system=system,
         name="gx_readout",
         role="readout",
@@ -253,26 +333,60 @@ def build_sequence(
         role="acquisition",
     )
 
+    # -------------------------------------------------------------------------
+    # Prephasers with deliberate ramp margin
+    # -------------------------------------------------------------------------
+    # Keep the existing 2 ms prephase block, but use slower explicit ramps.
+    # Re-realize the slice-rephasing AREA returned by make_sinc_pulse() over
+    # the same timing window so it is not pushed near Gmax by a shortest-time
+    # realization.
+    # -------------------------------------------------------------------------
+
+    prephaser_duration = float(protocol.parameters["prephaser_duration"])
+    prephaser_ramp_time = float(protocol.parameters["prephaser_ramp_time"])
+    prephaser_flat_time = prephaser_duration - 2.0 * prephaser_ramp_time
+
+    if prephaser_flat_time <= 0:
+        raise ValueError(
+            "prephaser_duration must exceed twice prephaser_ramp_time."
+        )
+
     gx_pre = ppstar.make_trapezoid(
         channel="x",
         axis_role="read",
         area=-0.5 * gx.area,
-        duration=p.prephaser_duration,
+        rise_time=prephaser_ramp_time,
+        flat_time=prephaser_flat_time,
+        fall_time=prephaser_ramp_time,
         system=system,
         name="gx_prephaser",
         role="prephasing",
     )
 
     # The representative phase encode uses unit area. kernel.vary() supplies
-    # the live strength/step progression for every phase-encoding line.
+    # the actual ky area for every line while timing remains fixed.
     gy_pre = ppstar.make_trapezoid(
         channel="y",
         axis_role="phase",
         area=1.0,
-        duration=p.prephaser_duration,
+        rise_time=prephaser_ramp_time,
+        flat_time=prephaser_flat_time,
+        fall_time=prephaser_ramp_time,
         system=system,
         name="gy_phase_encode",
         role="phase_encode",
+    )
+
+    gz_reph = ppstar.make_trapezoid(
+        channel="z",
+        axis_role="slice",
+        area=gz_reph.area,
+        rise_time=prephaser_ramp_time,
+        flat_time=prephaser_flat_time,
+        fall_time=prephaser_ramp_time,
+        system=system,
+        name="gz_rephaser",
+        role="rephasing",
     )
 
     # ================================================================
@@ -302,6 +416,11 @@ def build_sequence(
     # special case; developers can use the same abstraction for custom kernels,
     # RF/ADC phase/frequency changes, and gradient area/amplitude progressions.
     # ================================================================
+    rf_spoiling_phases = _rf_spoiling_phase_table(
+        int(protocol.parameters["n_y"]),
+        float(protocol.parameters["rf_spoiling_increment"]),
+    )
+
     kernel.vary(
         vary(
             gy_pre,
@@ -312,17 +431,36 @@ def build_sequence(
         vary(
             [rf, adc],
             "phase_offset",
-            strength=0.0,
-            step=p.rf_spoiling_increment * math.pi / 180.0,
-            mode="accumulated",
+            values=rf_spoiling_phases,
+            mode="table",
             wrap=2.0 * math.pi,
         ),
     )
 
+    # -------------------------------------------------------------------------
+    # Spoilers with deliberate hardware margin
+    # -------------------------------------------------------------------------
+    # Preserve the spoiler moments, but realize them over a common 2 ms window
+    # with 300 us ramps rather than using shortest-time waveforms that approach
+    # the declared Gmax/Smax limits.
+    # -------------------------------------------------------------------------
+
+    spoiler_duration = float(protocol.parameters["spoiler_duration"])
+    spoiler_ramp_time = float(protocol.parameters["spoiler_ramp_time"])
+    spoiler_flat_time = spoiler_duration - 2.0 * spoiler_ramp_time
+
+    if spoiler_flat_time <= 0:
+        raise ValueError(
+            "spoiler_duration must exceed twice spoiler_ramp_time."
+        )
+
     gx_spoil = ppstar.make_trapezoid(
         channel="x",
         axis_role="read",
-        area=2.0 * p.n_x * delta_k,
+        area=2.0 * p.n_x * delta_k_read,
+        rise_time=spoiler_ramp_time,
+        flat_time=spoiler_flat_time,
+        fall_time=spoiler_ramp_time,
         system=system,
         name="gx_spoil",
         role="spoiling",
@@ -330,12 +468,10 @@ def build_sequence(
     gy_spoil = ppstar.make_trapezoid(
         channel="y",
         axis_role="phase",
-        area=2.0 * p.n_y * delta_k,
-        # Let the phase spoiler choose its own shortest feasible duration.
-        # Coupling it to gx_spoil is invalid when n_y > n_x because the
-        # phase-spoiler area is larger while the forced duration remains
-        # sized for the read-spoiler area. All spoilers still begin in the
-        # same block; the block duration is set by the longest event.
+        area=2.0 * p.n_y * delta_k_phase,
+        rise_time=spoiler_ramp_time,
+        flat_time=spoiler_flat_time,
+        fall_time=spoiler_ramp_time,
         system=system,
         name="gy_spoil",
         role="spoiling",
@@ -344,6 +480,9 @@ def build_sequence(
         channel="z",
         axis_role="slice",
         area=4.0 / p.slice_thickness,
+        rise_time=spoiler_ramp_time,
+        flat_time=spoiler_flat_time,
+        fall_time=spoiler_ramp_time,
         system=system,
         name="gz_spoil",
         role="spoiling",
@@ -508,11 +647,11 @@ def main(
     if plot:
         seq.plot(
             realization=resolved,
-            repetitions=2,
+            repetitions=64,
             title=f"PyPulseq-Star Spoiled GRE ({orientation})",
             gradient_scale="mt_per_m",
             debug=debug,
-            one_tr=True,
+            one_tr=False,
         )
 
 
@@ -552,7 +691,21 @@ if __name__ == "__main__":
         description="Protocol-centered relationship-aware spoiled GRE demo."
     )
     parser.add_argument("--n-y", type=int, help="Override phase-encode matrix size.")
-    parser.add_argument("--fov", type=float, help="Override in-plane FOV in metres.")
+    parser.add_argument(
+        "--fov",
+        type=float,
+        help="Override both read and phase FOV in metres (backward-compatible shortcut).",
+    )
+    parser.add_argument(
+        "--fov-read",
+        type=float,
+        help="Override read-direction FOV in metres.",
+    )
+    parser.add_argument(
+        "--fov-phase",
+        type=float,
+        help="Override phase-direction FOV in metres.",
+    )
     parser.add_argument(
         "--rf-spoiling-increment",
         type=float,
@@ -581,6 +734,10 @@ if __name__ == "__main__":
         overrides["n_y"] = args.n_y
     if args.fov is not None:
         overrides["fov"] = args.fov
+    if args.fov_read is not None:
+        overrides["fov_read"] = args.fov_read
+    if args.fov_phase is not None:
+        overrides["fov_phase"] = args.fov_phase
     if args.rf_spoiling_increment is not None:
         overrides["rf_spoiling_increment"] = args.rf_spoiling_increment
     if args.te is not None:
@@ -596,4 +753,6 @@ if __name__ == "__main__":
         debug=args.debug,
         dashboard=args.dashboard,
         protocol_overrides=overrides,
+        seq_filename=f'gre_{args.orientation}_{args.n_y}.seq',
+        json_filename=f'gre_{args.orientation}_{args.n_y}.seq.json',
     )

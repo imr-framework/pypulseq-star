@@ -103,6 +103,47 @@ class PulseqWriter:
         self.auto_resolve_relationships = auto_resolve_relationships
         self.profile = bool(profile)
 
+    def read(
+        self,
+        path: str | Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> pp.Sequence:
+        """Read a conventional Pulseq ``.seq`` file with PyPulseq.
+
+        This is intentionally a thin compatibility/validation adapter around
+        :meth:`pypulseq.Sequence.read`; it does *not* convert the file into the
+        relationship-aware SeqStar object model.  The returned object is the
+        native ``pypulseq.Sequence`` produced by PyPulseq.
+
+        Keeping this path delegated to PyPulseq gives the Pulseq backend an
+        independent parser for round-trip/compliance tests.  Positional and
+        keyword arguments are forwarded unchanged so this method tracks the
+        installed PyPulseq ``Sequence.read`` API without duplicating its
+        version-specific signature here.
+
+        Examples
+        --------
+        >>> parsed = PulseqWriter(seq).read("reference.seq")
+        >>> ok, report = parsed.check_timing()
+
+        Parameters
+        ----------
+        path
+            Pulseq ``.seq`` file to read.
+        *args, **kwargs
+            Forwarded directly to ``pypulseq.Sequence.read``.
+
+        Returns
+        -------
+        pypulseq.Sequence
+            The parsed native PyPulseq sequence.
+        """
+
+        pulseq_seq = pp.Sequence()
+        pulseq_seq.read(str(Path(path)), *args, **kwargs)
+        return pulseq_seq
+
     def write(
         self,
         path: str | Path,
@@ -235,9 +276,37 @@ class PulseqWriter:
                     if not events:
                         continue
 
+                    motif_record = _sequence_node_registry(self.sequence).get(
+                        motif_name,
+                        {},
+                    )
+                    motif_counter = (
+                        str(motif_record.get("counter"))
+                        if isinstance(motif_record, Mapping)
+                        and motif_record.get("counter")
+                        else None
+                    )
+                    motif_context = (
+                        {motif_counter: _motif_index}
+                        if motif_counter is not None
+                        else {}
+                    )
+
                     for _block_repeat_index in range(block_repetitions):
+                        varied_events = [
+                            _event_with_variations_for_context(
+                                _event_variants_for_context(
+                                    event,
+                                    sequence=self.sequence,
+                                    context=motif_context,
+                                ),
+                                sequence=self.sequence,
+                                context=motif_context,
+                            )
+                            for event in events
+                        ]
                         pulseq_event_groups = _events_to_pulseq_event_groups(
-                            events,
+                            varied_events,
                             system=pulseq_seq.system,
                             adc_train_policy=self.adc_train_policy,
                             allow_multiwindow_adc_with_other_events=(
@@ -1369,25 +1438,26 @@ def _to_pypulseq_event(event: Any, system: pp.Opts) -> Any | None:
     return None
 
 def _rf_to_pypulseq(event: Any, system: pp.Opts) -> Any:
-    """Convert a SeqStar RF event to PyPulseq RF.
+    """Convert a SeqStar RF event to a faithful PyPulseq RF event.
 
-    Current conservative behavior:
-        RF exports as a block pulse.
+    Export policy
+    -------------
+    1. If a sampled RF envelope is retained, export it with make_arbitrary_rf().
+    2. If the SeqStar event identifies a known analytic family (currently sinc
+       or Gaussian), reconstruct that family with the corresponding PyPulseq
+       constructor using the retained shape parameters.
+    3. Use make_block_pulse() only for RF events explicitly identified as block/
+       rectangular/hard pulses.
+    4. Otherwise fail loudly rather than silently replacing a shaped RF pulse
+       by a rectangular pulse.
 
-    Export-time raster policy:
-        RF delay and RF duration are snapped to the Pulseq block raster so the
-        emitted .seq block duration is representable.
+    This is intentionally shape-preserving.  The writer must not infer that an
+    RF event is rectangular merely because its Python class or parent block name
+    contains the word "block".
     """
 
     flip_angle = float(getattr(event, "flip_angle"))
-
-    duration = _get_event_active_duration(event)
-    duration = _snap_time_to_raster(
-        duration,
-        _block_duration_raster(system),
-        name="RF duration",
-        mode="nearest",
-    )
+    duration = float(_get_event_active_duration(event))
 
     delay = _get_event_delay(event)
     delay = _snap_time_to_raster(
@@ -1397,29 +1467,418 @@ def _rf_to_pypulseq(event: Any, system: pp.Opts) -> Any:
         mode="nearest",
     )
 
-    phase_offset = _get_timing_or_attr(
-        event,
-        keys=("phase_offset", "phase", "rf_phase", "excitation_phase"),
-        default=0.0,
+    phase_offset = float(
+        _get_timing_or_attr(
+            event,
+            keys=("phase_offset", "phase", "rf_phase", "excitation_phase"),
+            default=0.0,
+        )
     )
-
-    freq_offset = _get_timing_or_attr(
-        event,
-        keys=("freq_offset", "frequency", "frequency_offset", "rf_frequency_offset"),
-        default=0.0,
+    freq_offset = float(
+        _get_timing_or_attr(
+            event,
+            keys=("freq_offset", "frequency", "frequency_offset", "rf_frequency_offset"),
+            default=0.0,
+        )
     )
 
     use = getattr(event, "use", None) or getattr(event, "role", None) or ""
+    use = _normalize_rf_use_for_pulseq(use)
 
-    return pp.make_block_pulse(
-        flip_angle=flip_angle,
-        delay=delay,
-        duration=duration,
-        phase_offset=float(phase_offset),
-        freq_offset=float(freq_offset),
-        system=system,
-        use=use,
+    # Best case: preserve the exact sampled envelope retained by SeqStar.
+    signal = _rf_waveform_for_pulseq(event)
+    if signal is not None:
+        dwell = _rf_dwell_for_pulseq(
+            event,
+            system=system,
+            num_samples=len(signal),
+            active_duration=duration,
+        )
+        return pp.make_arbitrary_rf(
+            signal=np.asarray(signal),
+            flip_angle=flip_angle,
+            delay=delay,
+            dwell=dwell,
+            phase_offset=phase_offset,
+            freq_offset=freq_offset,
+            system=system,
+            use=use,
+        )
+
+    kind = _rf_shape_kind(event)
+
+    # SeqStar's make_sinc_pulse retains the analytic pulse family/parameters
+    # even when the sampled waveform itself is not carried into the resolved
+    # event.  Reconstruct the same analytic family in PyPulseq rather than
+    # replacing it with a rectangular pulse.
+    if "sinc" in kind:
+        apodization = float(
+            _rf_parameter(
+                event,
+                ("apodization", "alpha"),
+                default=0.0,
+            )
+        )
+        time_bw_product = float(
+            _rf_parameter(
+                event,
+                ("time_bw_product", "time_bandwidth_product", "tbw", "tbwp"),
+                default=4.0,
+            )
+        )
+        center_pos = float(
+            _rf_parameter(
+                event,
+                ("center_pos", "center_position"),
+                default=0.5,
+            )
+        )
+        dwell = float(
+            _rf_parameter(
+                event,
+                ("dwell", "dwell_time", "sample_time", "dt"),
+                default=0.0,
+            )
+        )
+
+        return pp.make_sinc_pulse(
+            flip_angle=flip_angle,
+            apodization=apodization,
+            delay=delay,
+            duration=duration,
+            dwell=dwell,
+            center_pos=center_pos,
+            freq_offset=freq_offset,
+            phase_offset=phase_offset,
+            return_gz=False,
+            system=system,
+            time_bw_product=time_bw_product,
+            use=use,
+        )
+
+    if "gauss" in kind or "gaussian" in kind:
+        apodization = float(
+            _rf_parameter(event, ("apodization", "alpha"), default=0.0)
+        )
+        time_bw_product = float(
+            _rf_parameter(
+                event,
+                ("time_bw_product", "time_bandwidth_product", "tbw", "tbwp"),
+                default=4.0,
+            )
+        )
+        center_pos = float(
+            _rf_parameter(
+                event,
+                ("center_pos", "center_position"),
+                default=0.5,
+            )
+        )
+
+        kwargs = dict(
+            flip_angle=flip_angle,
+            apodization=apodization,
+            delay=delay,
+            duration=duration,
+            freq_offset=freq_offset,
+            phase_offset=phase_offset,
+            return_gz=False,
+            system=system,
+            time_bw_product=time_bw_product,
+            use=use,
+        )
+        # PyPulseq versions differ on whether center_pos is exposed for
+        # make_gauss_pulse(), so add it only when supported.
+        try:
+            if "center_pos" in inspect.signature(pp.make_gauss_pulse).parameters:
+                kwargs["center_pos"] = center_pos
+        except Exception:
+            pass
+        return pp.make_gauss_pulse(**kwargs)
+
+    if _rf_is_explicit_block_shape(event):
+        duration = _snap_time_to_raster(
+            duration,
+            _block_duration_raster(system),
+            name="RF duration",
+            mode="nearest",
+        )
+        return pp.make_block_pulse(
+            flip_angle=flip_angle,
+            delay=delay,
+            duration=duration,
+            phase_offset=phase_offset,
+            freq_offset=freq_offset,
+            system=system,
+            use=use,
+        )
+
+    raise ValueError(
+        "Pulseq export cannot preserve this RF event. No sampled RF envelope "
+        "was found and the RF family was not recognized as sinc, Gaussian, or "
+        "an explicitly rectangular/block pulse. Refusing to silently replace "
+        "the RF waveform with a block pulse. "
+        f"event={getattr(event, 'name', event)!r}, shape_kind={kind!r}."
     )
+
+
+def _rf_parameter(
+    event: Any,
+    keys: tuple[str, ...],
+    *,
+    default: Any = None,
+) -> Any:
+    """Read an RF shape parameter from event/shape/parameters/metadata.
+
+    SeqStar has carried pulse-family metadata in more than one container during
+    development.  The Pulseq adapter therefore accepts all of the generic
+    locations without depending on a particular sequence family.
+    """
+
+    candidates: list[Any] = [
+        event,
+        getattr(event, "shape", None),
+        getattr(event, "parameters", None),
+        getattr(event, "metadata", None),
+    ]
+
+    # Also inspect nested RF/shape dictionaries when present.
+    for container in (
+        getattr(event, "parameters", None),
+        getattr(event, "metadata", None),
+    ):
+        if isinstance(container, Mapping):
+            for nested_key in ("shape", "rf", "pulse", "rf_shape"):
+                nested = container.get(nested_key)
+                if nested is not None:
+                    candidates.append(nested)
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        value = _value_from_object_or_mapping(candidate, keys=keys)
+        if value is not None:
+            return value
+
+    return default
+
+
+def _rf_waveform_for_pulseq(event: Any) -> np.ndarray | None:
+    """Return a sampled RF envelope without discarding complex phase."""
+
+    candidates = [
+        event,
+        getattr(event, "shape", None),
+        getattr(event, "parameters", None),
+        getattr(event, "metadata", None),
+    ]
+
+    for container in (
+        getattr(event, "parameters", None),
+        getattr(event, "metadata", None),
+    ):
+        if isinstance(container, Mapping):
+            for nested_key in ("shape", "rf", "pulse", "rf_shape"):
+                nested = container.get(nested_key)
+                if nested is not None:
+                    candidates.append(nested)
+
+    keys = (
+        "signal",
+        "waveform",
+        "rf_signal",
+        "rf_waveform",
+        "envelope",
+    )
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+
+        for key in keys:
+            if isinstance(candidate, Mapping):
+                value = candidate.get(key)
+            else:
+                if not hasattr(candidate, key):
+                    continue
+                try:
+                    value = getattr(candidate, key)
+                except Exception:
+                    continue
+
+            if callable(value):
+                try:
+                    value = value()
+                except TypeError:
+                    continue
+
+            if value is None or np.isscalar(value):
+                continue
+
+            try:
+                array = np.asarray(value)
+            except Exception:
+                continue
+
+            if array.ndim != 1 or array.size < 2:
+                continue
+
+            if np.iscomplexobj(array):
+                return np.asarray(array, dtype=complex)
+
+            try:
+                return np.asarray(array, dtype=float)
+            except (TypeError, ValueError):
+                continue
+
+    return None
+
+
+def _rf_dwell_for_pulseq(
+    event: Any,
+    *,
+    system: pp.Opts,
+    num_samples: int,
+    active_duration: float,
+) -> float:
+    """Return the RF sample dwell for an explicitly sampled RF envelope."""
+
+    if num_samples < 1:
+        raise ValueError("RF waveform must contain at least one sample.")
+
+    explicit = _rf_parameter(
+        event,
+        ("dwell", "dwell_time", "sample_time", "dt", "rf_raster_time"),
+        default=None,
+    )
+    if explicit is not None and float(explicit) > 0:
+        return float(explicit)
+
+    rf_raster = float(getattr(system, "rf_raster_time", 0.0) or 0.0)
+    if rf_raster > 0:
+        raster_duration = num_samples * rf_raster
+        tolerance = max(1e-12, 0.5 * rf_raster)
+        if abs(raster_duration - active_duration) <= tolerance:
+            return rf_raster
+
+    inferred = float(active_duration) / float(num_samples)
+    if inferred <= 0:
+        raise ValueError(
+            f"Could not infer a positive RF dwell from duration={active_duration} "
+            f"and num_samples={num_samples}."
+        )
+    return inferred
+
+
+def _rf_shape_kind(event: Any) -> str:
+    """Return the most specific normalized RF family identifier available."""
+
+    # Prefer explicit family metadata and do NOT use the Python class name.
+    # In particular, many sequence implementations contain "block" in generic
+    # container class names; that is not evidence for a rectangular RF pulse.
+    keys = (
+        "shape_kind",
+        "shape_type",
+        "pulse_type",
+        "rf_type",
+        "rf_family",
+        "kind",
+    )
+
+    candidates: list[Any] = [
+        event,
+        getattr(event, "shape", None),
+        getattr(event, "parameters", None),
+        getattr(event, "metadata", None),
+    ]
+
+    for container in (
+        getattr(event, "parameters", None),
+        getattr(event, "metadata", None),
+    ):
+        if isinstance(container, Mapping):
+            for nested_key in ("shape", "rf", "pulse", "rf_shape"):
+                nested = container.get(nested_key)
+                if nested is not None:
+                    candidates.append(nested)
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        value = _value_from_object_or_mapping(candidate, keys=keys)
+        if value is None:
+            continue
+        text = str(value).strip().lower()
+        if text:
+            return text
+
+    # As a narrow compatibility fallback, use an RF event name only when it
+    # explicitly names the pulse family.
+    name = str(getattr(event, "name", "") or "").strip().lower()
+    for token in ("sinc", "gauss", "gaussian", "rect", "rectangular", "hard", "block"):
+        if token in name:
+            return token
+
+    return ""
+
+
+def _rf_is_explicit_block_shape(event: Any) -> bool:
+    """Return True only when RF metadata explicitly identifies a block pulse."""
+
+    kind = _rf_shape_kind(event)
+    return kind in {
+        "block",
+        "rf_block",
+        "rect",
+        "rectangular",
+        "hard",
+        "hard_pulse",
+        "block_pulse",
+    } or any(
+        token in kind
+        for token in ("rectangular", "hard_pulse", "block_pulse")
+    )
+
+
+def _normalize_rf_use_for_pulseq(use: Any) -> str:
+    """Map common SeqStar RF-role spellings to PyPulseq RF ``use`` values."""
+
+    text = str(use or "").strip().lower()
+    aliases = {
+        "excite": "excitation",
+        "excitation": "excitation",
+        "refocus": "refocusing",
+        "refocusing": "refocusing",
+        "invert": "inversion",
+        "inversion": "inversion",
+        "saturate": "saturation",
+        "saturation": "saturation",
+        "prepare": "preparation",
+        "preparation": "preparation",
+    }
+    return aliases.get(text, text)
+
+
+def _value_from_object_or_mapping(
+    candidate: Any,
+    *,
+    keys: tuple[str, ...],
+) -> Any:
+    """Read the first non-None value from an object or mapping."""
+
+    for key in keys:
+        if isinstance(candidate, Mapping):
+            value = candidate.get(key)
+        else:
+            if not hasattr(candidate, key):
+                continue
+            try:
+                value = getattr(candidate, key)
+            except Exception:
+                continue
+        if value is not None:
+            return value
+    return None
 
 
 def _adc_to_pypulseq(event: Any, system: pp.Opts) -> Any:
@@ -1979,10 +2438,80 @@ def _gradient_to_pypulseq(
     )
 
 
+
+def _trapezoid_constructor_specs(event: Any) -> Mapping[str, Any] | None:
+    """Return retained trapezoid constructor specs when available.
+
+    The resolved SeqStar event carries solved amplitude/timing fields, but those
+    fields are not always the quantities the developer authored.  Retained
+    constructor metadata lets the writer preserve the original defining
+    contract (area, flat_area, or amplitude, plus explicitly supplied timing)
+    when lowering a varied/resolved event to PyPulseq.
+    """
+
+    metadata = getattr(event, "metadata", None)
+    constructor = (
+        metadata.get("symbolic_constructor")
+        if isinstance(metadata, Mapping)
+        else None
+    )
+
+    if not isinstance(constructor, Mapping):
+        parameters = getattr(event, "parameters", None)
+        constructor = (
+            parameters.get("_symbolic_constructor")
+            if isinstance(parameters, Mapping)
+            else None
+        )
+
+    if not isinstance(constructor, Mapping):
+        return None
+    if str(constructor.get("family", "")).strip().lower() != "trapezoid":
+        return None
+
+    specs = constructor.get("specs")
+    return specs if isinstance(specs, Mapping) else None
+
+
+def _trapezoid_authored_fields(
+    event: Any,
+) -> tuple[str | None, set[str]]:
+    """Return the authored defining quantity and timing fields for a trapezoid."""
+
+    specs = _trapezoid_constructor_specs(event)
+    if specs is None:
+        return None, set()
+
+    defining = [
+        name
+        for name in ("amplitude", "flat_area", "area")
+        if specs.get(name) is not None
+    ]
+    defining_field = defining[0] if len(defining) == 1 else None
+
+    timing_fields = {
+        name
+        for name in ("duration", "rise_time", "flat_time", "fall_time")
+        if specs.get(name) is not None
+    }
+    return defining_field, timing_fields
+
+
 def _trapezoid_gradient_to_pypulseq(
     event: Any, system: pp.Opts, *, channel: str, scale: float = 1.0
 ) -> Any:
-    """Lower a SeqStar trapezoid-like gradient to ``pp.make_trapezoid``."""
+    """Lower a SeqStar trapezoid while preserving its authored constructor contract.
+
+    Resolved SeqStar trapezoids expose amplitude, area, and solved timing
+    simultaneously.  That solved representation is useful for plotting, but it
+    must not erase which fields the developer originally specified.  In
+    particular, an ``area + duration`` gradient that later varies in area must
+    be re-realized from the new area and the authored duration; reusing the
+    provisional solved ramp times can create an artificial slew violation.
+
+    When retained constructor metadata is unavailable, this function falls back
+    to the legacy resolved-waveform behavior.
+    """
 
     delay = _gradient_float(
         event,
@@ -1999,62 +2528,84 @@ def _trapezoid_gradient_to_pypulseq(
     amplitude = _gradient_value(event, keys=("amplitude", "amp"), default=None)
     flat_area = _gradient_value(event, keys=("flat_area",), default=None)
     area = _gradient_value(event, keys=("area",), default=None)
-    if amplitude is not None: 
+
+    if amplitude is not None:
         amplitude = float(amplitude) * scale
-    if flat_area is not None: 
+    if flat_area is not None:
         flat_area = float(flat_area) * scale
-    if area is not None: 
+    if area is not None:
         area = float(area) * scale
 
     rise_time = _gradient_value(event, keys=("rise_time", "rut"), default=None)
     flat_time = _gradient_value(event, keys=("flat_time", "ft"), default=None)
     fall_time = _gradient_value(event, keys=("fall_time", "rdt"), default=None)
-    duration = _gradient_value(event, keys=("duration", "shape_duration"), default=None)
+    duration = _gradient_value(
+        event,
+        keys=("duration", "shape_duration"),
+        default=None,
+    )
 
     grad_raster = float(getattr(system, "grad_raster_time", 10e-6))
-
     kwargs: dict[str, Any] = {
         "channel": channel,
         "delay": delay,
         "system": system,
     }
 
-    # PyPulseq's make_trapezoid requires exactly one defining quantity from
-    # amplitude / flat_area / area. Prefer amplitude when the SeqStar shape has
-    # already solved the trapezoid geometry, because that preserves the exact
-    # waveform generated by pypulseq_star.make_trapezoid.
-    if amplitude is not None:
-        kwargs["amplitude"] = float(amplitude)
+    defining_field, timing_fields = _trapezoid_authored_fields(event)
+
+    # Preserve the authored defining quantity whenever constructor provenance is
+    # available.  Variation updates the current event value; the retained
+    # metadata is used only to decide which quantity owns the realization.
+    if defining_field == "area" and area is not None:
+        kwargs["area"] = area
+    elif defining_field == "flat_area" and flat_area is not None:
+        kwargs["flat_area"] = flat_area
+    elif defining_field == "amplitude" and amplitude is not None:
+        kwargs["amplitude"] = amplitude
+    elif amplitude is not None:
+        kwargs["amplitude"] = amplitude
     elif flat_area is not None:
-        kwargs["flat_area"] = float(flat_area)
+        kwargs["flat_area"] = flat_area
     elif area is not None:
-        kwargs["area"] = float(area)
+        kwargs["area"] = area
     else:
-        # Last-resort fallback: integrate a waveform if the object exposes one.
         waveform = _gradient_waveform_for_pulseq(event)
         if waveform is not None:
-            return _arbitrary_gradient_to_pypulseq(event, system, channel=channel)
+            return _arbitrary_gradient_to_pypulseq(
+                event,
+                system,
+                channel=channel,
+            )
         raise ValueError(
             "Trapezoid gradient export requires at least one of amplitude, "
             "flat_area, or area. The event/shape did not expose any of them. "
             f"event={event!r}"
         )
 
-    if rise_time is not None:
+    # With constructor provenance, only forward timing fields that were
+    # explicitly authored.  Without provenance, retain the previous behavior
+    # and forward the resolved timing fields.
+    use_resolved_timing = not timing_fields and defining_field is None
+
+    def _include_timing(name: str) -> bool:
+        return use_resolved_timing or name in timing_fields
+
+    if rise_time is not None and _include_timing("rise_time"):
         kwargs["rise_time"] = _snap_time_to_raster(
             float(rise_time),
             grad_raster,
             name="gradient rise_time",
             mode="nearest",
         )
-    if flat_time is not None:
+    if flat_time is not None and _include_timing("flat_time"):
         kwargs["flat_time"] = _snap_time_to_raster(
             float(flat_time),
             grad_raster,
             name="gradient flat_time",
             mode="nearest",
         )
-    if fall_time is not None:
+    if fall_time is not None and _include_timing("fall_time"):
         kwargs["fall_time"] = _snap_time_to_raster(
             float(fall_time),
             grad_raster,
@@ -2062,9 +2613,14 @@ def _trapezoid_gradient_to_pypulseq(
             mode="nearest",
         )
 
-    # If an amplitude-defined trapezoid lacks flat_time but has a duration,
-    # pass duration through to PyPulseq. This mirrors PyPulseq's public API.
-    if "amplitude" in kwargs and "flat_time" not in kwargs and duration is not None:
+    if duration is not None and (
+        "duration" in timing_fields
+        or (
+            use_resolved_timing
+            and "flat_time" not in kwargs
+            and "amplitude" in kwargs
+        )
+    ):
         active_duration = float(duration) - delay
         if active_duration <= 0:
             active_duration = float(duration)
@@ -2196,10 +2752,13 @@ def _is_split_gradient_event(event: Any) -> bool:
 
 
 def _is_arbitrary_gradient_event(event: Any) -> bool:
-    """Return True if the object should be exported as an arbitrary gradient."""
+    """Return True if the object should be exported as an arbitrary gradient.
 
-    if _gradient_waveform_for_pulseq(event) is None:
-        return False
+    Class/kind metadata is checked before waveform probing.  Trapezoids expose
+    callable plotting waveforms too, and evaluating those merely to classify the
+    event is both unnecessary and unsafe while a varied trapezoid is awaiting
+    backend re-realization.
+    """
 
     shape = getattr(event, "shape", None)
     class_names = " ".join(
@@ -2209,9 +2768,6 @@ def _is_arbitrary_gradient_event(event: Any) -> bool:
     )
     kind = str(_gradient_value(event, keys=("kind", "type"), default="")).lower()
 
-    # Trapezoids also expose a waveform for plotting. Keep them as trapezoids
-    # when they expose trapezoid-defining fields, unless the class/kind clearly
-    # marks the object as arbitrary/grad.
     if "trapezoid" in class_names or kind in {"trap", "trapezoid"}:
         return False
 
@@ -2220,17 +2776,28 @@ def _is_arbitrary_gradient_event(event: Any) -> bool:
         "arbitrary_grad",
         "arbitrary_gradient",
     }:
-        return True
+        return _gradient_waveform_for_pulseq(event) is not None
 
-    # Do not treat generic kind/type='grad' as arbitrary. Many SeqStar
-    # gradient events use the generic physical-event type 'grad' while the
-    # shape carries the actual subtype. Only fall back to arbitrary when no
-    # trapezoid-defining quantity is available.
-    return _gradient_value(event, keys=("amplitude", "area", "flat_area"), default=None) is None
+    # Generic gradient wrappers may carry either a trapezoid or an arbitrary
+    # shape.  A defining trapezoid quantity wins; otherwise require an actual
+    # readable waveform before classifying the event as arbitrary.
+    if _gradient_value(
+        event,
+        keys=("amplitude", "area", "flat_area"),
+        default=None,
+    ) is not None:
+        return False
+
+    return _gradient_waveform_for_pulseq(event) is not None
 
 
 def _gradient_waveform_for_pulseq(event: Any) -> list[float] | None:
-    """Return waveform samples for arbitrary-gradient export, if available."""
+    """Return waveform samples for arbitrary-gradient export, if available.
+
+    Property access is deliberately defensive: enriched trapezoid waveforms may
+    be temporarily non-evaluable while an area variation is waiting for backend
+    realization, and classification/introspection must not fail because of that.
+    """
 
     candidates = [event, getattr(event, "shape", None)]
 
@@ -2239,15 +2806,15 @@ def _gradient_waveform_for_pulseq(event: Any) -> list[float] | None:
             continue
 
         for attr in ("waveform", "samples", "signal"):
-            if not hasattr(candidate, attr):
+            try:
+                value = getattr(candidate, attr)
+            except Exception:
                 continue
-
-            value = getattr(candidate, attr)
 
             if callable(value):
                 try:
                     value = value()
-                except TypeError:
+                except Exception:
                     continue
 
             if value is None:
@@ -2255,14 +2822,13 @@ def _gradient_waveform_for_pulseq(event: Any) -> list[float] | None:
 
             try:
                 samples = [float(x) for x in value]
-            except TypeError:
+            except (TypeError, ValueError):
                 continue
 
             if samples:
                 return samples
 
     return None
-
 
 def _gradient_value(event: Any, *, keys: tuple[str, ...], default: Any = None) -> Any:
     """Read a gradient value from event, shape, parameters, metadata, or dicts."""
@@ -2435,6 +3001,469 @@ def _event_variants_for_context(
     return copy.deepcopy(variants[flat_index])
 
 
+def _variation_event_name(event: Any) -> str:
+    """Return the stable event identifier used by node.vary() bindings."""
+
+    return str(
+        getattr(event, "name", None)
+        or getattr(event, "path", None)
+        or event.__class__.__name__
+    )
+
+
+def _variation_binding_targets_event(
+    binding: Mapping[str, Any],
+    *,
+    event: Any,
+) -> bool:
+    """Return whether a variation binding explicitly targets ``event``.
+
+    ``seqstar_loop_binding`` may also be used as generic loop metadata.  Generic
+    loop metadata must never be interpreted as an event variation merely because
+    the event happens to expose the same property name (for example ``area`` on
+    every gradient in a GRE prephase block).
+    """
+
+    event_name = _variation_event_name(event)
+
+    names = binding.get("event_names")
+    if isinstance(names, Iterable) and not isinstance(
+        names, (str, bytes, bytearray, Mapping)
+    ):
+        return event_name in {str(name) for name in names}
+
+    for key in (
+        "event_name",
+        "target_event_name",
+        "target_name",
+        "event",
+        "target",
+    ):
+        value = binding.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float)):
+            return event_name == str(value)
+
+    # No explicit event target: this may be generic loop metadata, not a
+    # node.vary() record.  Do not apply it as an event variation.
+    return False
+
+
+def _variation_records_for_event(
+    event: Any,
+    *,
+    sequence: Any,
+) -> list[Mapping[str, Any]]:
+    """Return declarative ``node.vary()`` records for exactly one event.
+
+    Resolution/deepcopy can change Python identity, so matching is ultimately
+    performed by the stable event name recorded in ``event_names``.
+
+    Important
+    ---------
+    ``seqstar_loop_binding`` can describe the surrounding loop itself and is
+    therefore *not* accepted as an event variation unless it explicitly names
+    the current event.  This prevents, for example, the GRE phase-encode
+    ``gy.area`` variation from being applied to ``gx_pre`` simply because both
+    gradients live in the same repeated block and both expose an ``area`` field.
+    """
+
+    event_name = _variation_event_name(event)
+
+    def _filtered(records: Any, *, directly_attached: bool) -> list[Mapping[str, Any]]:
+        if not isinstance(records, Iterable) or isinstance(
+            records, (str, bytes, bytearray, Mapping)
+        ):
+            return []
+
+        matched: list[Mapping[str, Any]] = []
+        for item in records:
+            if not isinstance(item, Mapping):
+                continue
+
+            names = item.get("event_names")
+            if isinstance(names, Iterable) and not isinstance(
+                names, (str, bytes, bytearray, Mapping)
+            ):
+                if event_name in {str(name) for name in names}:
+                    matched.append(item)
+                continue
+
+            # A variation record stored directly on an event is event-specific
+            # even in older objects that did not record event_names.
+            if directly_attached:
+                matched.append(item)
+
+        return matched
+
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, Mapping):
+        records = _filtered(
+            metadata.get("seqstar_variations"),
+            directly_attached=True,
+        )
+        if records:
+            return records
+
+        binding = metadata.get("seqstar_loop_binding")
+        if isinstance(binding, Mapping) and _variation_binding_targets_event(
+            binding,
+            event=event,
+        ):
+            return [binding]
+
+    parameters = getattr(event, "parameters", None)
+    if isinstance(parameters, Mapping):
+        records = _filtered(
+            parameters.get("_seqstar_variations"),
+            directly_attached=True,
+        )
+        if records:
+            return records
+
+    # Authoritative fallback: logical-node registry + explicit event_names.
+    for record in _sequence_node_registry(sequence).values():
+        variations = record.get("variations")
+        records = _filtered(
+            variations,
+            directly_attached=False,
+        )
+        if records:
+            return records
+
+    return []
+
+
+def _evaluate_variation_scalar(
+    value: Any,
+    *,
+    sequence: Any,
+    label: str,
+) -> float:
+    """Resolve one declarative variation scalar to a numeric value.
+
+    ``node.vary(...)`` may retain protocol expressions in ``strength``, ``step``,
+    or ``wrap``.  Pulseq export expands the logical loop, so those expressions
+    must be evaluated against the sequence/realization before the concrete event
+    is lowered to PyPulseq.
+    """
+
+    if value is None:
+        raise ValueError(f"Variation {label} must not be None.")
+
+    if hasattr(value, "eval") and callable(getattr(value, "eval")):
+        try:
+            value = value.eval(sequence)
+        except TypeError:
+            value = value.eval()
+
+    # Resolved scalar wrappers occasionally expose ``value``.
+    if not isinstance(value, (str, bytes, bytearray, int, float, complex, np.number)):
+        wrapped = getattr(value, "value", None)
+        if wrapped is not None and wrapped is not value:
+            value = wrapped
+
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"Could not resolve variation {label} to a numeric scalar: {value!r}."
+        ) from exc
+
+
+def _write_gradient_value_if_present(
+    obj: Any,
+    *,
+    key: str,
+    value: Any,
+) -> None:
+    """Update an existing gradient field without inventing new public fields."""
+
+    if obj is None:
+        return
+
+    try:
+        if hasattr(obj, key):
+            setattr(obj, key, value)
+    except Exception:
+        pass
+
+    params = getattr(obj, "parameters", None)
+    if isinstance(params, dict) and key in params:
+        params[key] = value
+
+
+def _scale_event_for_area_variation(
+    event: Any,
+    *,
+    old_area: float,
+    new_area: float,
+) -> None:
+    """Keep derived trapezoid state coherent after an area variation.
+
+    The varied ``area`` is the source of truth.  Retained constructor metadata
+    decides whether the solved shape timing is authoritative:
+
+    - Explicit rise/flat/fall timing: recompute the derived amplitude while
+      preserving those authored times.
+    - Area + duration or area-only constructors: leave provisional solved shape
+      geometry alone and let backend lowering re-realize from the authored
+      constructor contract.
+    - Legacy events without constructor provenance: retain proportional
+      amplitude scaling for backward compatibility.
+
+    Derived values are written directly to parameter/shape storage.  In
+    particular, this intentionally avoids assigning ``event.amplitude`` because
+    the public amplitude setter also rescales area, which would apply an area
+    variation a second time.
+    """
+
+    defining_field, timing_fields = _trapezoid_authored_fields(event)
+    has_constructor = defining_field is not None or bool(timing_fields)
+    fixed_shape = {"rise_time", "flat_time", "fall_time"}.issubset(timing_fields)
+
+    old_amplitude = _gradient_value(
+        event,
+        keys=("amplitude", "amp"),
+        default=None,
+    )
+    new_amplitude: float | None = None
+
+    if fixed_shape:
+        rise = float(_gradient_value(event, keys=("rise_time", "rut"), default=0.0) or 0.0)
+        flat = float(_gradient_value(event, keys=("flat_time", "ft"), default=0.0) or 0.0)
+        fall = float(_gradient_value(event, keys=("fall_time", "rdt"), default=0.0) or 0.0)
+        area_per_amplitude = flat + 0.5 * (rise + fall)
+        if area_per_amplitude > 0:
+            new_amplitude = float(new_area) / area_per_amplitude
+    elif not has_constructor and old_amplitude is not None and abs(old_area) > 1e-30:
+        new_amplitude = float(old_amplitude) * float(new_area) / float(old_area)
+
+    parameters = getattr(event, "parameters", None)
+    shape = getattr(event, "shape", None)
+
+    if new_amplitude is None:
+        # For area-defined constructors whose timing must be re-solved, remove
+        # only event-level derived overrides.  Do not set shape.amplitude=None:
+        # trapezoid waveform properties legitimately expect a numeric amplitude.
+        if has_constructor and isinstance(parameters, dict):
+            parameters.pop("amplitude", None)
+            parameters.pop("amp", None)
+            parameters.pop("flat_area", None)
+        return
+
+    # Update derived state without invoking SeqStarGradientEvent.amplitude, whose
+    # setter intentionally changes area and would therefore double-apply the
+    # declarative area variation.
+    if isinstance(parameters, dict):
+        parameters["amplitude"] = new_amplitude
+        parameters.pop("amp", None)
+        if fixed_shape:
+            flat = float(_gradient_value(event, keys=("flat_time", "ft"), default=0.0) or 0.0)
+            parameters["flat_area"] = new_amplitude * flat
+
+    if shape is not None:
+        try:
+            setattr(shape, "amplitude", new_amplitude)
+        except Exception:
+            pass
+        shape_parameters = getattr(shape, "parameters", None)
+        if isinstance(shape_parameters, dict):
+            shape_parameters["amplitude"] = new_amplitude
+            shape_parameters.pop("amp", None)
+            if fixed_shape:
+                shape_parameters["flat_area"] = new_amplitude * flat
+
+def _set_event_variation_property(
+    event: Any,
+    *,
+    attribute: str,
+    value: Any,
+) -> None:
+    """Set one varied property and keep dependent concrete event data coherent.
+
+    Phase/frequency-like properties can be assigned directly.  Gradient area is
+    special because a resolved SeqStar trapezoid also carries a solved amplitude
+    or waveform, and the Pulseq writer intentionally prefers that solved
+    representation.  For area variation we therefore scale those dependent
+    amplitude-like fields as well.
+    """
+
+    old_area: float | None = None
+    if attribute == "area":
+        try:
+            current = _gradient_value(event, keys=("area",), default=None)
+            if current is not None:
+                old_area = float(current)
+        except Exception:
+            old_area = None
+
+    try:
+        setattr(event, attribute, value)
+    except Exception:
+        pass
+
+    parameters = getattr(event, "parameters", None)
+    if isinstance(parameters, dict):
+        parameters[attribute] = value
+
+    shape = getattr(event, "shape", None)
+    if shape is not None:
+        try:
+            if hasattr(shape, attribute):
+                setattr(shape, attribute, value)
+        except Exception:
+            pass
+        shape_parameters = getattr(shape, "parameters", None)
+        if isinstance(shape_parameters, dict):
+            shape_parameters[attribute] = value
+
+    if attribute == "area" and old_area is not None:
+        _scale_event_for_area_variation(
+            event,
+            old_area=old_area,
+            new_area=float(value),
+        )
+
+    # Enriched ADC trains carry per-window phase/frequency values.
+    windows = getattr(shape, "windows", None) if shape is not None else None
+    if windows is None:
+        windows = getattr(event, "windows", None)
+
+    if windows is not None:
+        for window in windows:
+            if isinstance(window, dict):
+                window[attribute] = value
+                continue
+            try:
+                setattr(window, attribute, value)
+            except Exception:
+                pass
+
+
+def _event_with_variations_for_context(
+    event: Any,
+    *,
+    sequence: Any,
+    context: dict[str, int],
+) -> Any:
+    """Return an event copy with active ``node.vary()`` relationships applied.
+
+    Pulseq has no symbolic runtime loop for SeqStar's generic variation
+    contract, so the writer expands each logical loop occurrence to a concrete
+    event value.
+
+    Supported modes
+    ---------------
+    table
+        ``values[counter % len(values)]``
+
+    linear / accumulated / alternating
+        These arithmetic modes follow the existing gammaSTAR lowering contract:
+        ``strength + counter * step`` with optional modulo wrapping.  The mode
+        label remains available to richer backends, but concrete Pulseq export
+        must at minimum materialize the declared progression instead of
+        repeating the unmodified event.
+
+    This function is deliberately sequence-agnostic: it operates only on the
+    declarative variation records attached by ``node.vary()``.
+    """
+
+    records = _variation_records_for_event(event, sequence=sequence)
+    active: list[tuple[str, Any]] = []
+
+    for binding in records:
+        counter = str(binding.get("counter") or "").strip()
+        if not counter or counter not in context:
+            continue
+
+        index = int(context[counter])
+        mode = str(binding.get("mode") or "linear").strip().lower()
+
+        if mode == "table":
+            values = binding.get("values")
+            if values is None:
+                raise ValueError(
+                    "Table variation requires a non-empty values table."
+                )
+            try:
+                table = tuple(values)
+            except TypeError as exc:
+                raise TypeError(
+                    "Table variation values must be iterable."
+                ) from exc
+
+            if not table:
+                raise ValueError(
+                    "Table variation requires at least one value."
+                )
+
+            value = table[index % len(table)]
+
+        elif mode in {"linear", "accumulated", "alternating"}:
+            strength = _evaluate_variation_scalar(
+                binding.get("strength"),
+                sequence=sequence,
+                label="strength",
+            )
+            step = _evaluate_variation_scalar(
+                binding.get("step"),
+                sequence=sequence,
+                label="step",
+            )
+            value = strength + index * step
+
+        else:
+            raise ValueError(
+                f"Unsupported Pulseq loop variation mode {mode!r}."
+            )
+
+        wrap = binding.get("wrap")
+        if wrap is not None:
+            wrap_value = _evaluate_variation_scalar(
+                wrap,
+                sequence=sequence,
+                label="wrap",
+            )
+            if wrap_value != 0:
+                value = float(value) % wrap_value
+
+        attribute = str(binding.get("attribute") or "").strip()
+        if not attribute:
+            continue
+
+        active.append((attribute, value))
+
+    if not active:
+        return event
+
+    varied = copy.deepcopy(event)
+
+    for attribute, value in active:
+        _set_event_variation_property(
+            varied,
+            attribute=attribute,
+            value=value,
+        )
+
+    return varied
+
+
+def _event_with_table_variations_for_context(
+    event: Any,
+    *,
+    sequence: Any,
+    context: dict[str, int],
+) -> Any:
+    """Backward-compatible alias for the generic variation materializer."""
+
+    return _event_with_variations_for_context(
+        event,
+        sequence=sequence,
+        context=context,
+    )
+
 def _emit_one_block_with_context(
     *,
     sequence: Any,
@@ -2445,8 +3474,12 @@ def _emit_one_block_with_context(
     allow_multiwindow_adc_with_other_events: bool,
 ) -> float:
     events = [
-        _event_variants_for_context(
-            event,
+        _event_with_variations_for_context(
+            _event_variants_for_context(
+                event,
+                sequence=sequence,
+                context=context,
+            ),
             sequence=sequence,
             context=context,
         )

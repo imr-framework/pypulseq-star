@@ -42,6 +42,10 @@ dependencies = [
 plotting = [
   "matplotlib>=3.7",
 ]
+
+rf = [
+    "sigpy>=0.1.25",
+]
 dashboard = [
   "grandalf>=0.8",
   "matplotlib>=3.7",
@@ -57,10 +61,11 @@ dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0",
   "ruff>=0.6",
+  "sigpy>=0.1.25",
   "twine>=5.1",
 ]
 all = [
-  "pypulseq-star[plotting,dashboard,dev]",
+  "pypulseq-star[plotting,rf,dashboard,dev]",
 ]
 
 [tool.hatch.version]
@@ -121,7 +126,7 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
-skip_covered = true
+skip_covered = false
 fail_under = 65
 exclude_lines = [
   "pragma: no cover",
