@@ -111,7 +111,7 @@ def define_protocol(
             "sequence_type": "GRE",
             "orientation": orientation,
             "fov": fov,
-            "n_x": 64,
+            "n_x": 256,
             "n_y": n_y,
             "slice_thickness": 3e-3,
             "flip_angle": 10.0,

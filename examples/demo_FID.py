@@ -109,7 +109,7 @@ def define_protocol(
             "rf_duration": 300e-6,
             "echo_time": 20e-3,
             "repetition_time": 1.0,
-            "average": 4,
+            "average": 1,
             "num_samples": 2048,
             "dwell": 20e-6,
             "rf_phase_offset": 0.0,

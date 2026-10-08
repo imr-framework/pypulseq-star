@@ -132,9 +132,10 @@ def define_system() -> ppstar.Opts:
         max_rf=15e-6,
         rf_ringdown_time=20e-6,
         rf_dead_time=100e-6,
-        adc_dead_time=10e-6,
+        adc_dead_time=50e-6,
         rf_raster_time=2e-6,
         grad_raster_time=10e-6,
+
     )
 
 
@@ -277,8 +278,9 @@ def define_protocol(
             #
             #     acquisition duration = num_samples * dwell
             #
-            "spectroscopy_num_samples": 2048,               # samples
-            "spectroscopy_dwell_s": 500e-6,                 # s/sample
+            "spectroscopy_num_samples": 4096,               # samples
+            "spectroscopy_dwell_s": 200e-6,                 # s/sample
+            # "spectroscopy_dwell_s": 20e-6,                 # s/sample
 
             # -------------------------------------------------------------
             # Number of signal averages
@@ -295,6 +297,7 @@ def define_protocol(
             #
             # Boolean protocol controls.
             #
+            "spectroscopy_metabolite_enabled": True,
             "spectroscopy_water_suppression_enabled": True,
             "water_reference_enabled": True,
         },
@@ -1180,8 +1183,9 @@ def make_press(
 #             averages_water               [loop: NSA, repeat_every = TR]
 #                 kernel_press
 #
-# The acquisition-family nodes (metabolite / water) are semantic containers.
-# Only the averages_* nodes repeat. Each repeated node owns:
+# The acquisition families are selectable independently (metabolite, water, or full).
+# The enabled family nodes are semantic containers. Only the averages_* nodes repeat.
+# Each repeated node owns:
 #
 #     repeat_count
 #     repeat_every = TR
@@ -1245,35 +1249,51 @@ def build_sequence(
     # repetition owner and therefore also owns the PRESS phase-cycle variation.
     # =========================================================================
 
-    seq.set_node(
-        "root.metabolite",
-        role="spectroscopy_metabolite",
+    metabolite_enabled = bool(
+        protocol.parameters["spectroscopy_metabolite_enabled"]
+    )
+    water_enabled = bool(
+        protocol.parameters["water_reference_enabled"]
     )
 
-    metabolite_averages = seq.set_node(
-        "root.metabolite.averages_metabolite",
-        role="spectroscopy_metabolite_averages",
-        factor=p.spectroscopy_metabolite_nsa,
-        repeat_every=p.press_repetition_time_s,
-        counter="metabolite_nsa_index",
-        repeat_mode="loop",
-    )
-
-    if protocol.parameters["spectroscopy_water_suppression_enabled"]:
-        make_vapor(
-            seq,
-            protocol,
-            node="root.metabolite.averages_metabolite.vapor",
+    if not metabolite_enabled and not water_enabled:
+        raise ValueError(
+            "PRESS must enable at least one acquisition family: metabolite or water."
         )
 
-    make_press(
-        seq,
-        protocol,
-        voxel=voxel,
-        node="root.metabolite.averages_metabolite.kernel_press",
-        repeat_node=metabolite_averages,
-        phase_cycle=PRESS_EXORCYCLE_16,
-    )
+    if metabolite_enabled:
+        if int(protocol.parameters["spectroscopy_metabolite_nsa"]) < 1:
+            raise ValueError("Metabolite NSA must be >= 1 when metabolite acquisition is enabled.")
+
+        seq.set_node(
+            "root.metabolite",
+            role="spectroscopy_metabolite",
+        )
+
+        metabolite_averages = seq.set_node(
+            "root.metabolite.averages_metabolite",
+            role="spectroscopy_metabolite_averages",
+            factor=p.spectroscopy_metabolite_nsa,
+            repeat_every=p.press_repetition_time_s,
+            counter="metabolite_nsa_index",
+            repeat_mode="loop",
+        )
+
+        if protocol.parameters["spectroscopy_water_suppression_enabled"]:
+            make_vapor(
+                seq,
+                protocol,
+                node="root.metabolite.averages_metabolite.vapor",
+            )
+
+        make_press(
+            seq,
+            protocol,
+            voxel=voxel,
+            node="root.metabolite.averages_metabolite.kernel_press",
+            repeat_node=metabolite_averages,
+            phase_cycle=PRESS_EXORCYCLE_16,
+        )
 
     # =========================================================================
     # Unsuppressed water-reference acquisition family
@@ -1288,7 +1308,9 @@ def build_sequence(
     # identical PRESS kernel implementation. No VAPOR node is present.
     # =========================================================================
 
-    if protocol.parameters["water_reference_enabled"]:
+    if water_enabled:
+        if int(protocol.parameters["water_reference_nsa"]) < 1:
+            raise ValueError("Water-reference NSA must be >= 1 when water acquisition is enabled.")
 
         seq.set_node(
             "root.water",
@@ -1317,12 +1339,75 @@ def build_sequence(
 
 
 # =============================================================================
-# 9. MAIN / RESOLVE / PLOT / EXPORT
+# 9. ACQUISITION SELECTION / OUTPUT NAMING
+# =============================================================================
+
+
+def _apply_acquisition_mode(
+    overrides: dict[str, object],
+    acquisition: str,
+) -> None:
+    """Apply water-only, metabolite-only, or full acquisition selection."""
+
+    if acquisition == "water":
+        overrides["spectroscopy_metabolite_enabled"] = False
+        overrides["water_reference_enabled"] = True
+    elif acquisition == "metabolite":
+        overrides["spectroscopy_metabolite_enabled"] = True
+        overrides["water_reference_enabled"] = False
+    elif acquisition == "full":
+        overrides["spectroscopy_metabolite_enabled"] = True
+        overrides["water_reference_enabled"] = True
+    else:
+        raise ValueError(
+            "acquisition must be one of: water, metabolite, full."
+        )
+
+
+def _acquisition_mode_from_protocol(protocol) -> str:
+    """Return the enabled acquisition family label for diagnostics/output names."""
+
+    metabolite_enabled = bool(protocol.spectroscopy_metabolite_enabled)
+    water_enabled = bool(protocol.water_reference_enabled)
+
+    if metabolite_enabled and water_enabled:
+        return "full"
+    if metabolite_enabled:
+        return "metabolite"
+    if water_enabled:
+        return "water"
+
+    raise ValueError(
+        "Resolved PRESS protocol has neither metabolite nor water acquisition enabled."
+    )
+
+
+def _output_stem(protocol, orientation: str) -> str:
+    """Build a debug-friendly output stem including acquisition family and NSA."""
+
+    acquisition = _acquisition_mode_from_protocol(protocol)
+
+    if acquisition == "full":
+        averages = (
+            f"metabolite_nsa{int(protocol.spectroscopy_metabolite_nsa)}_"
+            f"water_nsa{int(protocol.water_reference_nsa)}"
+        )
+    elif acquisition == "metabolite":
+        averages = f"metabolite_nsa{int(protocol.spectroscopy_metabolite_nsa)}"
+    else:
+        averages = f"water_nsa{int(protocol.water_reference_nsa)}"
+
+    return f"press_{acquisition}_{averages}_{orientation}"
+
+
+# =============================================================================
+# 10. MAIN / RESOLVE / PLOT / EXPORT
 # =============================================================================
 
 
 def main(
     *,
+    acquisition: str | None = None,
     orientation: str = "axial",
     plot: bool = True,
     write_seq: bool = True,
@@ -1336,6 +1421,12 @@ def main(
 
     overrides = dict(protocol_overrides or {})
     overrides["press_orientation"] = orientation
+
+    if acquisition is not None:
+        _apply_acquisition_mode(
+            overrides,
+            acquisition,
+        )
 
     protocol = define_protocol(
         overrides=overrides,
@@ -1374,10 +1465,17 @@ def main(
 )
     
     print(f"TR:  {resolved.protocol.press_repetition_time_s * 1e3:.3f} ms")
-    print(
-        f"Metabolite NSA: "
-        f"{resolved.protocol.spectroscopy_metabolite_nsa}"
+
+    acquisition_mode = _acquisition_mode_from_protocol(
+        resolved.protocol
     )
+    print(f"Acquisition: {acquisition_mode}")
+
+    if resolved.protocol.spectroscopy_metabolite_enabled:
+        print(
+            f"Metabolite NSA: "
+            f"{resolved.protocol.spectroscopy_metabolite_nsa}"
+        )
 
     if resolved.protocol.water_reference_enabled:
         print(
@@ -1403,11 +1501,16 @@ def main(
         exist_ok=True,
     )
 
+    output_stem = _output_stem(
+        resolved.protocol,
+        orientation,
+    )
+
     if write_seq:
         seq_path = PulseqWriter(
             seq
         ).write(
-            output_dir / f"press_{orientation}.seq",
+            output_dir / f"{output_stem}.seq",
             realization=resolved,
         )
 
@@ -1420,7 +1523,7 @@ def main(
         json_path = GammaStarWriter(
             seq
         ).write(
-            output_dir / f"press_{orientation}.seq.json",
+            output_dir / f"{output_stem}.seq.json",
             defaults=resolved,
         )
 
@@ -1430,7 +1533,7 @@ def main(
 
 
 # =============================================================================
-# 10. COMMAND-LINE INTERFACE
+# 11. COMMAND-LINE INTERFACE
 # =============================================================================
 
 
@@ -1440,6 +1543,16 @@ if __name__ == "__main__":
         description=(
             "Protocol-centered relationship-aware PRESS spectroscopy demo."
         )
+    )
+
+    parser.add_argument(
+        "--acquisition",
+        choices=("water", "metabolite", "full"),
+        default="full",
+        help=(
+            "Select acquisition family: unsuppressed water only, "
+            "water-suppressed metabolite only, or full (metabolite + water)."
+        ),
     )
 
     parser.add_argument(
@@ -1461,15 +1574,19 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--metabolite-nsa",
         "--nsa",
+        dest="metabolite_nsa",
         type=int,
         help="Override metabolite number of signal averages.",
     )
 
     parser.add_argument(
+        "--water-nsa",
         "--water-reference-nsa",
+        dest="water_nsa",
         type=int,
-        help="Override water-reference number of signal averages.",
+        help="Override unsuppressed water-reference number of signal averages.",
     )
 
     parser.add_argument(
@@ -1571,11 +1688,15 @@ if __name__ == "__main__":
     if args.tr is not None:
         overrides["press_repetition_time_s"] = args.tr
 
-    if args.nsa is not None:
-        overrides["spectroscopy_metabolite_nsa"] = args.nsa
+    if args.metabolite_nsa is not None:
+        if args.metabolite_nsa < 1:
+            parser.error("--metabolite-nsa must be >= 1")
+        overrides["spectroscopy_metabolite_nsa"] = args.metabolite_nsa
 
-    if args.water_reference_nsa is not None:
-        overrides["water_reference_nsa"] = args.water_reference_nsa
+    if args.water_nsa is not None:
+        if args.water_nsa < 1:
+            parser.error("--water-nsa must be >= 1")
+        overrides["water_reference_nsa"] = args.water_nsa
 
     if args.voxel_size_read is not None:
         overrides["press_voxel_size_read_m"] = args.voxel_size_read
@@ -1605,9 +1726,15 @@ if __name__ == "__main__":
         overrides["spectroscopy_water_suppression_enabled"] = False
 
     if args.no_water_reference:
-        overrides["water_reference_enabled"] = False
+        if args.acquisition == "water":
+            parser.error(
+                "--no-water-reference conflicts with --acquisition water"
+            )
+        if args.acquisition == "full":
+            args.acquisition = "metabolite"
 
     main(
+        acquisition=args.acquisition,
         orientation=args.orientation,
         plot=not args.no_plot,
         write_seq=not args.no_seq,
