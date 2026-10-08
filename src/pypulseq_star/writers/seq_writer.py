@@ -2497,6 +2497,31 @@ def _trapezoid_authored_fields(
     return defining_field, timing_fields
 
 
+def _active_variation_value(
+    event: Any,
+    attribute: str,
+) -> Any | None:
+    """Return the concrete value applied by the current loop variation.
+
+    ``node.vary(...)`` is materialized per logical-loop occurrence before
+    backend lowering. Resolved gradient objects may still expose provisional
+    solved amplitude/area state from the representative kernel, so the writer
+    records the value applied for the current loop context and treats that value
+    as authoritative during Pulseq lowering.
+    """
+
+    for container_name in ("metadata", "parameters"):
+        container = getattr(event, container_name, None)
+        if not isinstance(container, Mapping):
+            continue
+
+        active = container.get("_seqstar_active_variation_values")
+        if isinstance(active, Mapping) and attribute in active:
+            return active[attribute]
+
+    return None
+
+
 def _trapezoid_gradient_to_pypulseq(
     event: Any, system: pp.Opts, *, channel: str, scale: float = 1.0
 ) -> Any:
@@ -2554,10 +2579,24 @@ def _trapezoid_gradient_to_pypulseq(
 
     defining_field, timing_fields = _trapezoid_authored_fields(event)
 
-    # Preserve the authored defining quantity whenever constructor provenance is
-    # available.  Variation updates the current event value; the retained
-    # metadata is used only to decide which quantity owns the realization.
-    if defining_field == "area" and area is not None:
+    # A loop variation is more specific than the representative-kernel
+    # realization. In particular, a phase-encode ``area`` variation must be
+    # lowered from the area selected for the current counter value, not from
+    # the amplitude/area solved once for the representative event.
+    varied_area = _active_variation_value(event, "area")
+    varied_flat_area = _active_variation_value(event, "flat_area")
+    varied_amplitude = _active_variation_value(event, "amplitude")
+
+    if varied_area is not None:
+        kwargs["area"] = float(varied_area) * scale
+    elif varied_flat_area is not None:
+        kwargs["flat_area"] = float(varied_flat_area) * scale
+    elif varied_amplitude is not None:
+        kwargs["amplitude"] = float(varied_amplitude) * scale
+    # Otherwise preserve the authored defining quantity whenever constructor
+    # provenance is available. The retained metadata is used only to decide
+    # which quantity owns the realization.
+    elif defining_field == "area" and area is not None:
         kwargs["area"] = area
     elif defining_field == "flat_area" and flat_area is not None:
         kwargs["flat_area"] = flat_area
@@ -3307,6 +3346,15 @@ def _set_event_variation_property(
     parameters = getattr(event, "parameters", None)
     if isinstance(parameters, dict):
         parameters[attribute] = value
+        parameters.setdefault("_seqstar_active_variation_values", {})[
+            attribute
+        ] = value
+
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, dict):
+        metadata.setdefault("_seqstar_active_variation_values", {})[
+            attribute
+        ] = value
 
     shape = getattr(event, "shape", None)
     if shape is not None:
